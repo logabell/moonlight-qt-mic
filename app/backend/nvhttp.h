@@ -170,7 +170,12 @@ public:
              bool localAudio,
              int gamepadMask,
              bool persistGameControllersOnDisconnect,
-             QString& rtspSessionUrl);
+             QString& rtspSessionUrl,
+             QString extraLaunchParameters = QString(),
+             QString* usbPassthroughTunnelMode = nullptr,
+             quint16* usbPassthroughTunnelPort = nullptr,
+             QString* usbPassthroughTunnelToken = nullptr,
+             quint16* usbPassthroughExporterPort = nullptr);
 
     QVector<NvApp>
     getAppList();

@@ -140,6 +140,45 @@ private:
     QMap<QString, QStringList> m_Choices;
 };
 
+static bool parseGlobalActionName(const QString& actionName, GlobalCommandLineParser::ParseResult* result)
+{
+    const QString action = actionName.toLower();
+    if (action == QStringLiteral("quit")) {
+        *result = GlobalCommandLineParser::QuitRequested;
+        return true;
+    }
+    if (action == QStringLiteral("stream")) {
+        *result = GlobalCommandLineParser::StreamRequested;
+        return true;
+    }
+    if (action == QStringLiteral("pair")) {
+        *result = GlobalCommandLineParser::PairRequested;
+        return true;
+    }
+    if (action == QStringLiteral("list")) {
+        *result = GlobalCommandLineParser::ListRequested;
+        return true;
+    }
+    if (action == QStringLiteral("usb-lab-list")) {
+        *result = GlobalCommandLineParser::UsbLabListRequested;
+        return true;
+    }
+    if (action == QStringLiteral("usb-lab-install")) {
+        *result = GlobalCommandLineParser::UsbLabInstallRequested;
+        return true;
+    }
+    if (action == QStringLiteral("usb-lab-export")) {
+        *result = GlobalCommandLineParser::UsbLabExportRequested;
+        return true;
+    }
+    if (action == QStringLiteral("usb-lab-tunnel")) {
+        *result = GlobalCommandLineParser::UsbLabTunnelRequested;
+        return true;
+    }
+
+    return false;
+}
+
 GlobalCommandLineParser::GlobalCommandLineParser()
 {
 }
@@ -161,12 +200,23 @@ GlobalCommandLineParser::ParseResult GlobalCommandLineParser::parse(const QStrin
         "  quit            Quit the currently running app\n"
         "  stream          Start streaming an app\n"
         "  pair            Pair a new host\n"
+        "  usb-lab-list    List USB passthrough client status and devices\n"
+        "  usb-lab-install Check or launch USB passthrough dependency setup\n"
+        "  usb-lab-export  Share a USB device for direct/broker lab validation\n"
+        "  usb-lab-tunnel  Open a USB reverse tunnel for lab validation\n"
         "\n"
         "See 'moonlight <action> --help' for help of specific action."
     );
     parser.addPositionalArgument("action", "Action to execute", "<action>");
     parser.parse(args);
     auto posArgs = parser.positionalArguments();
+
+    for (int i = 1; i < args.size(); i++) {
+        ParseResult result;
+        if (parseGlobalActionName(args.at(i), &result)) {
+            return result;
+        }
+    }
 
     if (posArgs.isEmpty()) {
         // This method will not return and terminates the process if --version
@@ -183,15 +233,9 @@ GlobalCommandLineParser::ParseResult GlobalCommandLineParser::parse(const QStrin
         // commands can accept. To work around this issue, we just look
         // for "quit" or "stream" positional arguments anywhere.
         for (int i = 0; i < posArgs.size(); i++) {
-            QString action = posArgs.at(i).toLower();
-            if (action == "quit") {
-                return QuitRequested;
-            } else if (action == "stream") {
-                return StreamRequested;
-            } else if (action == "pair") {
-                return PairRequested;
-            } else if (action == "list") {
-                return ListRequested;
+            ParseResult result;
+            if (parseGlobalActionName(posArgs.at(i), &result)) {
+                return result;
             }
         }
 
@@ -590,4 +634,322 @@ bool ListCommandLineParser::isPrintCSV() const
 bool ListCommandLineParser::isVerbose() const
 {
     return m_Verbose;
+}
+
+UsbLabTunnelCommandLineParser::UsbLabTunnelCommandLineParser()
+    : m_Port(0),
+      m_ExporterPort(3240),
+      m_HoldSeconds(-1),
+      m_Bind(false),
+      m_Json(false)
+{
+}
+
+UsbLabTunnelCommandLineParser::~UsbLabTunnelCommandLineParser()
+{
+}
+
+void UsbLabTunnelCommandLineParser::parse(const QStringList &args)
+{
+    CommandLineParser parser;
+    parser.setupCommonOptions();
+    parser.setApplicationDescription(
+        "\n"
+        "Open a USB passthrough reverse tunnel to a Vibepollo host for lab validation."
+    );
+    parser.addPositionalArgument("usb-lab-tunnel", "open USB lab tunnel");
+    parser.addPositionalArgument("host", "Vibepollo host address", "<host>");
+    parser.addPositionalArgument("port", "Vibepollo USB reverse tunnel port", "<port>");
+    parser.addPositionalArgument("token", "Vibepollo USB reverse tunnel token", "<token>");
+    parser.addPositionalArgument("busid", "Local USB device bus ID", "<busid>");
+    parser.addPositionalArgument("exporter-port", "Local USB/IP exporter port", "[exporter-port]");
+    parser.addFlagOption("bind", "binding/sharing the device before opening the tunnel");
+    parser.addFlagOption("json", "JSON output for tunnel state");
+    parser.addValueOption("hold-seconds", "seconds to keep the tunnel open before stopping automatically");
+    parser.addValueOption("output", "path to write tunnel state JSON");
+
+    if (!parser.parse(args)) {
+        parser.showError(parser.errorText());
+    }
+
+    parser.handleUnknownOptions();
+    parser.handleHelpAndVersionOptions();
+
+    auto posArgs = parser.positionalArguments();
+    if (posArgs.length() < 5) {
+        parser.showError("host, port, token, and busid are required");
+    }
+    if (posArgs.length() > 6) {
+        parser.showError("too many positional arguments");
+    }
+
+    bool ok = false;
+    int port = posArgs.at(2).toInt(&ok);
+    if (!ok || !inRange(port, 1, 65535)) {
+        parser.showError(QString("Invalid port value: %1").arg(posArgs.at(2)));
+    }
+
+    int exporterPort = 3240;
+    if (posArgs.length() >= 6) {
+        exporterPort = posArgs.at(5).toInt(&ok);
+        if (!ok || !inRange(exporterPort, 1, 65535)) {
+            parser.showError(QString("Invalid exporter-port value: %1").arg(posArgs.at(5)));
+        }
+    }
+
+    m_Host = posArgs.at(1);
+    m_Port = static_cast<quint16>(port);
+    m_Token = posArgs.at(3);
+    m_BusId = posArgs.at(4);
+    m_ExporterPort = static_cast<quint16>(exporterPort);
+    m_HoldSeconds = -1;
+    if (parser.isSet("hold-seconds")) {
+        int holdSeconds = parser.value("hold-seconds").toInt(&ok);
+        if (!ok || !inRange(holdSeconds, 0, 86400)) {
+            parser.showError(QString("Invalid hold-seconds value: %1").arg(parser.value("hold-seconds")));
+        }
+        m_HoldSeconds = holdSeconds;
+    }
+    m_Bind = parser.isSet("bind");
+    m_Json = parser.isSet("json");
+    m_OutputPath = parser.value("output");
+}
+
+QString UsbLabTunnelCommandLineParser::getHost() const
+{
+    return m_Host;
+}
+
+quint16 UsbLabTunnelCommandLineParser::getPort() const
+{
+    return m_Port;
+}
+
+QString UsbLabTunnelCommandLineParser::getToken() const
+{
+    return m_Token;
+}
+
+QString UsbLabTunnelCommandLineParser::getBusId() const
+{
+    return m_BusId;
+}
+
+quint16 UsbLabTunnelCommandLineParser::getExporterPort() const
+{
+    return m_ExporterPort;
+}
+
+int UsbLabTunnelCommandLineParser::getHoldSeconds() const
+{
+    return m_HoldSeconds;
+}
+
+bool UsbLabTunnelCommandLineParser::shouldBind() const
+{
+    return m_Bind;
+}
+
+bool UsbLabTunnelCommandLineParser::isJson() const
+{
+    return m_Json;
+}
+
+QString UsbLabTunnelCommandLineParser::getOutputPath() const
+{
+    return m_OutputPath;
+}
+
+UsbLabInstallCommandLineParser::UsbLabInstallCommandLineParser()
+    : m_DryRun(false),
+      m_Json(false)
+{
+}
+
+UsbLabInstallCommandLineParser::~UsbLabInstallCommandLineParser()
+{
+}
+
+void UsbLabInstallCommandLineParser::parse(const QStringList &args)
+{
+    CommandLineParser parser;
+    parser.setupCommonOptions();
+    parser.setApplicationDescription(
+        "\n"
+        "Check or launch USB passthrough dependency setup for lab validation."
+    );
+    parser.addPositionalArgument("usb-lab-install", "check or launch USB passthrough dependency setup");
+    parser.addFlagOption("dry-run", "checking dependency setup without launching installers or administrator prompts");
+    parser.addFlagOption("json", "JSON output for install state");
+    parser.addValueOption("output", "path to write install state JSON");
+
+    if (!parser.parse(args)) {
+        parser.showError(parser.errorText());
+    }
+
+    parser.handleUnknownOptions();
+    parser.handleHelpAndVersionOptions();
+
+    auto posArgs = parser.positionalArguments();
+    if (posArgs.length() > 1) {
+        parser.showError("too many positional arguments");
+    }
+
+    m_DryRun = parser.isSet("dry-run");
+    m_Json = parser.isSet("json");
+    m_OutputPath = parser.value("output");
+    if (!m_OutputPath.isEmpty()) {
+        m_Json = true;
+    }
+}
+
+bool UsbLabInstallCommandLineParser::isDryRun() const
+{
+    return m_DryRun;
+}
+
+bool UsbLabInstallCommandLineParser::isJson() const
+{
+    return m_Json;
+}
+
+QString UsbLabInstallCommandLineParser::getOutputPath() const
+{
+    return m_OutputPath;
+}
+
+UsbLabExportCommandLineParser::UsbLabExportCommandLineParser()
+    : m_HoldSeconds(-1),
+      m_Bind(false),
+      m_Json(false)
+{
+}
+
+UsbLabExportCommandLineParser::~UsbLabExportCommandLineParser()
+{
+}
+
+void UsbLabExportCommandLineParser::parse(const QStringList &args)
+{
+    CommandLineParser parser;
+    parser.setupCommonOptions();
+    parser.setApplicationDescription(
+        "\n"
+        "Share a local USB device through the client USB/IP exporter for lab validation."
+    );
+    parser.addPositionalArgument("usb-lab-export", "share USB device for lab validation");
+    parser.addPositionalArgument("busid", "Local USB device bus ID", "<busid>");
+    parser.addFlagOption("bind", "binding/sharing the device before exporting it");
+    parser.addFlagOption("json", "JSON output for export state");
+    parser.addValueOption("hold-seconds", "seconds to keep the exporter open before stopping automatically");
+    parser.addValueOption("output", "path to write export state JSON");
+
+    if (!parser.parse(args)) {
+        parser.showError(parser.errorText());
+    }
+
+    parser.handleUnknownOptions();
+    parser.handleHelpAndVersionOptions();
+
+    auto posArgs = parser.positionalArguments();
+    if (posArgs.length() < 2) {
+        parser.showError("busid is required");
+    }
+    if (posArgs.length() > 2) {
+        parser.showError("too many positional arguments");
+    }
+
+    m_BusId = posArgs.at(1);
+    bool ok = false;
+    m_HoldSeconds = -1;
+    if (parser.isSet("hold-seconds")) {
+        int holdSeconds = parser.value("hold-seconds").toInt(&ok);
+        if (!ok || !inRange(holdSeconds, 0, 86400)) {
+            parser.showError(QString("Invalid hold-seconds value: %1").arg(parser.value("hold-seconds")));
+        }
+        m_HoldSeconds = holdSeconds;
+    }
+    m_Bind = parser.isSet("bind");
+    m_Json = parser.isSet("json");
+    m_OutputPath = parser.value("output");
+}
+
+QString UsbLabExportCommandLineParser::getBusId() const
+{
+    return m_BusId;
+}
+
+int UsbLabExportCommandLineParser::getHoldSeconds() const
+{
+    return m_HoldSeconds;
+}
+
+bool UsbLabExportCommandLineParser::shouldBind() const
+{
+    return m_Bind;
+}
+
+bool UsbLabExportCommandLineParser::isJson() const
+{
+    return m_Json;
+}
+
+QString UsbLabExportCommandLineParser::getOutputPath() const
+{
+    return m_OutputPath;
+}
+
+UsbLabListCommandLineParser::UsbLabListCommandLineParser()
+    : m_Json(false),
+      m_TestExporter(false)
+{
+}
+
+UsbLabListCommandLineParser::~UsbLabListCommandLineParser()
+{
+}
+
+void UsbLabListCommandLineParser::parse(const QStringList &args)
+{
+    CommandLineParser parser;
+    parser.setupCommonOptions();
+    parser.setApplicationDescription(
+        "\n"
+        "List USB passthrough client dependency status and local USB devices for lab validation."
+    );
+    parser.addPositionalArgument("usb-lab-list", "list USB passthrough client status and devices");
+    parser.addFlagOption("json", "JSON output");
+    parser.addFlagOption("test-exporter", "a localhost USB/IP exporter connectivity probe");
+    parser.addValueOption("output", "path to write command output instead of stdout");
+
+    if (!parser.parse(args)) {
+        parser.showError(parser.errorText());
+    }
+
+    parser.handleUnknownOptions();
+    parser.handleHelpAndVersionOptions();
+
+    auto posArgs = parser.positionalArguments();
+    if (posArgs.length() > 1) {
+        parser.showError("too many positional arguments");
+    }
+
+    m_Json = parser.isSet("json");
+    m_TestExporter = parser.isSet("test-exporter");
+    m_OutputPath = parser.value("output");
+}
+
+bool UsbLabListCommandLineParser::isJson() const
+{
+    return m_Json;
+}
+
+bool UsbLabListCommandLineParser::shouldTestExporter() const
+{
+    return m_TestExporter;
+}
+
+QString UsbLabListCommandLineParser::getOutputPath() const
+{
+    return m_OutputPath;
 }

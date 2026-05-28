@@ -138,7 +138,10 @@ public:
     Q_PROPERTY(bool detectNetworkBlocking MEMBER detectNetworkBlocking NOTIFY detectNetworkBlockingChanged)
     Q_PROPERTY(bool showPerformanceOverlay MEMBER showPerformanceOverlay NOTIFY showPerformanceOverlayChanged)
     Q_PROPERTY(bool enableMicrophone MEMBER enableMicrophone NOTIFY enableMicrophoneChanged)
+    Q_PROPERTY(bool enableUsbPassthrough MEMBER enableUsbPassthrough NOTIFY enableUsbPassthroughChanged)
+    Q_PROPERTY(bool allowUsbStoragePassthrough MEMBER allowUsbStoragePassthrough NOTIFY allowUsbStoragePassthroughChanged)
     Q_PROPERTY(QString microphoneDevice MEMBER microphoneDevice NOTIFY microphoneDeviceChanged)
+    Q_PROPERTY(QStringList usbPassthroughDevices MEMBER usbPassthroughDevices NOTIFY usbPassthroughDevicesChanged)
     Q_PROPERTY(QStringList microphoneDevices READ microphoneDevices NOTIFY microphoneDevicesChanged)
     Q_PROPERTY(double microphoneMonitorLevel READ microphoneMonitorLevel NOTIFY microphoneMonitorLevelChanged)
     Q_PROPERTY(QString microphoneMonitorStatus READ microphoneMonitorStatus NOTIFY microphoneMonitorStatusChanged)
@@ -193,7 +196,10 @@ public:
     bool detectNetworkBlocking;
     bool showPerformanceOverlay;
     bool enableMicrophone;
+    bool enableUsbPassthrough;
+    bool allowUsbStoragePassthrough;
     QString microphoneDevice;
+    QStringList usbPassthroughDevices;
     bool swapMouseButtons;
     bool muteOnFocusLoss;
     bool backgroundGamepad;
@@ -241,7 +247,10 @@ signals:
     void detectNetworkBlockingChanged();
     void showPerformanceOverlayChanged();
     void enableMicrophoneChanged();
+    void enableUsbPassthroughChanged();
+    void allowUsbStoragePassthroughChanged();
     void microphoneDeviceChanged();
+    void usbPassthroughDevicesChanged();
     void microphoneDevicesChanged();
     void microphoneMonitorLevelChanged();
     void microphoneMonitorStatusChanged();

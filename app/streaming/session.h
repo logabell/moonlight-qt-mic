@@ -150,6 +150,9 @@ private:
 
     bool startConnectionAsync();
 
+    QString buildUsbPassthroughLaunchParameters();
+    void cleanupUsbPassthroughDevices();
+
     bool validateLaunch(SDL_Window* testWindow);
 
     void emitLaunchWarning(QString text);
@@ -267,6 +270,8 @@ private:
     int m_MouseEmulationRefCount;
     int m_FlushingWindowEventsRef;
     QStringList m_LaunchWarnings;
+    QStringList m_ActiveUsbPassthroughDevices;
+    QStringList m_BoundUsbPassthroughDevices;
     bool m_ShouldExit;
 
     bool m_AsyncConnectionSuccess;

@@ -10,8 +10,19 @@
 #include <QFont>
 #include <QCursor>
 #include <QElapsedTimer>
+#include <QFile>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QStandardPaths>
 #include <QTemporaryFile>
+#include <QTextStream>
 #include <QRegularExpression>
+
+#include <atomic>
+#include <chrono>
+#include <csignal>
+#include <iostream>
+#include <thread>
 
 #ifdef Q_OS_UNIX
 #include <sys/socket.h>
@@ -36,6 +47,7 @@
 #include <dxgi1_6.h>
 #elif defined(Q_OS_LINUX)
 #include <openssl/ssl.h>
+#include <unistd.h>
 #endif
 
 #include "cli/listapps.h"
@@ -51,6 +63,7 @@
 #include "backend/computermanager.h"
 #include "backend/systemproperties.h"
 #include "streaming/session.h"
+#include "streaming/usb/usbpassthroughmanager.h"
 #include "settings/streamingpreferences.h"
 #include "gui/sdlgamepadkeynavigation.h"
 
@@ -79,6 +92,7 @@ static QMutex s_SyncLoggerMutex;
 static bool s_SuppressVerboseOutput;
 static QRegularExpression k_RikeyRegex("&rikey=\\w+");
 static QRegularExpression k_RikeyIdRegex("&rikeyid=[\\d-]+");
+static constexpr quint16 k_UsbLabDefaultExporterPort = 3240;
 #ifdef LOG_TO_FILE
 // Max log file size of 10 MB
 static const uint64_t k_MaxLogSizeBytes = 10 * 1024 * 1024;
@@ -150,6 +164,776 @@ void logToLoggerStream(QString& message)
         // Log the message immediately
         LoggerTask(message).run();
     }
+}
+
+static std::atomic_bool s_UsbLabStopRequested {false};
+
+static void usbLabSignalHandler(int)
+{
+    s_UsbLabStopRequested.store(true, std::memory_order_release);
+}
+
+static void waitForUsbLabStop(int holdSeconds)
+{
+    s_UsbLabStopRequested.store(false, std::memory_order_release);
+    auto previousSigint = std::signal(SIGINT, usbLabSignalHandler);
+    auto previousSigterm = std::signal(SIGTERM, usbLabSignalHandler);
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(holdSeconds >= 0 ? holdSeconds : 0);
+    if (holdSeconds < 0) {
+        std::thread inputThread([]() {
+            std::string line;
+            std::getline(std::cin, line);
+            s_UsbLabStopRequested.store(true, std::memory_order_release);
+        });
+        inputThread.detach();
+    }
+
+    while (!s_UsbLabStopRequested.load(std::memory_order_acquire) &&
+           (holdSeconds < 0 || std::chrono::steady_clock::now() < deadline)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+
+    std::signal(SIGINT, previousSigint);
+    std::signal(SIGTERM, previousSigterm);
+}
+
+static std::string qtToStdString(const QString& value)
+{
+    return value.toLocal8Bit().constData();
+}
+
+static bool usbLabDeviceExportable(const UsbPassthroughManager& manager, const QString& busId, bool* found)
+{
+    if (found) {
+        *found = false;
+    }
+
+    for (const QVariant& deviceVariant : manager.devices()) {
+        const QVariantMap device = deviceVariant.toMap();
+        if (device.value(QStringLiteral("busid")).toString() != busId) {
+            continue;
+        }
+
+        if (found) {
+            *found = true;
+        }
+        const QString state = device.value(QStringLiteral("state")).toString();
+        return state == QStringLiteral("bound") || state == QStringLiteral("attached");
+    }
+
+    return false;
+}
+
+static QString usbLabYesNo(bool value)
+{
+    return value ? QStringLiteral("yes") : QStringLiteral("no");
+}
+
+static QString usbLabValueOrDash(const QString& value)
+{
+    return value.isEmpty() ? QStringLiteral("-") : value;
+}
+
+static QVariantMap usbLabStatusPayload(const UsbPassthroughManager& manager, bool exporterTested, bool exporterReady)
+{
+    QVariantMap payload;
+    payload[QStringLiteral("supported")] = manager.isSupported();
+    payload[QStringLiteral("backend")] = manager.backend();
+    payload[QStringLiteral("dependenciesReady")] = manager.dependenciesReady();
+    payload[QStringLiteral("statusMessage")] = manager.statusMessage();
+    payload[QStringLiteral("lastError")] = manager.lastError();
+    payload[QStringLiteral("usbipPath")] = manager.usbipPath();
+    payload[QStringLiteral("usbipdPath")] = manager.usbipdPath();
+    payload[QStringLiteral("usbipdServiceState")] = manager.usbipdServiceState();
+    payload[QStringLiteral("usbipCoreLoaded")] = manager.usbipCoreLoaded();
+    payload[QStringLiteral("usbipHostLoaded")] = manager.usbipHostLoaded();
+    payload[QStringLiteral("exporterTested")] = exporterTested;
+    if (exporterTested) {
+        payload[QStringLiteral("exporterReady")] = exporterReady;
+    }
+    payload[QStringLiteral("devices")] = manager.devices();
+    payload[QStringLiteral("deviceErrors")] = manager.deviceErrors();
+    return payload;
+}
+
+static QString formatUsbLabStatusHuman(const UsbPassthroughManager& manager, bool exporterTested, bool exporterReady)
+{
+    QString output;
+    QTextStream stream(&output);
+    stream << "USB passthrough client status\n";
+    stream << "Supported: " << usbLabYesNo(manager.isSupported()) << '\n';
+    stream << "Backend: " << usbLabValueOrDash(manager.backend()) << '\n';
+    stream << "Dependencies ready: " << usbLabYesNo(manager.dependenciesReady()) << '\n';
+    stream << "Status: " << usbLabValueOrDash(manager.statusMessage()) << '\n';
+    if (!manager.lastError().isEmpty()) {
+        stream << "Last error: " << manager.lastError() << '\n';
+    }
+    if (!manager.usbipPath().isEmpty()) {
+        stream << "usbip: " << manager.usbipPath() << '\n';
+    }
+    if (!manager.usbipdPath().isEmpty()) {
+        stream << "usbipd: " << manager.usbipdPath() << '\n';
+    }
+    if (!manager.usbipdServiceState().isEmpty()) {
+        stream << "usbipd service: " << manager.usbipdServiceState() << '\n';
+    }
+    if (manager.backend() == QStringLiteral("linux-usbip")) {
+        stream << "usbip-core module: " << usbLabYesNo(manager.usbipCoreLoaded()) << '\n';
+        stream << "usbip-host module: " << usbLabYesNo(manager.usbipHostLoaded()) << '\n';
+    }
+    if (exporterTested) {
+        stream << "Exporter probe: " << (exporterReady ? QStringLiteral("ready") : QStringLiteral("failed")) << '\n';
+    }
+
+    const QVariantList devices = manager.devices();
+    stream << "Devices: " << devices.size() << '\n';
+    const QVariantMap deviceErrors = manager.deviceErrors();
+    for (const QVariant& deviceVariant : devices) {
+        const QVariantMap device = deviceVariant.toMap();
+        const QString busId = device.value(QStringLiteral("busid")).toString();
+        const QString vid = device.value(QStringLiteral("vid")).toString();
+        const QString pid = device.value(QStringLiteral("pid")).toString();
+        const QString vidPid = (!vid.isEmpty() || !pid.isEmpty()) ? vid + QStringLiteral(":") + pid : QStringLiteral("-");
+        QString name = device.value(QStringLiteral("product")).toString();
+        const QString vendor = device.value(QStringLiteral("vendor")).toString();
+        if (!vendor.isEmpty() && !name.isEmpty()) {
+            name = vendor + QStringLiteral(" ") + name;
+        }
+        if (name.isEmpty()) {
+            name = device.value(QStringLiteral("description")).toString();
+        }
+        stream << "  " << usbLabValueOrDash(busId)
+               << "  " << usbLabValueOrDash(device.value(QStringLiteral("state")).toString())
+               << "  " << vidPid
+               << "  " << usbLabValueOrDash(device.value(QStringLiteral("deviceClass")).toString())
+               << "  " << usbLabValueOrDash(name)
+               << '\n';
+
+        const QString blockedReason = device.value(QStringLiteral("blockReason")).toString();
+        if (!blockedReason.isEmpty()) {
+            stream << "    blocked: " << blockedReason << '\n';
+        }
+        const QString error = deviceErrors.value(busId).toString();
+        if (!error.isEmpty()) {
+            stream << "    error: " << error << '\n';
+        }
+    }
+
+    return output;
+}
+
+static QVariantMap usbLabInstallPreflight(const UsbPassthroughManager& manager)
+{
+    QVariantMap preflight;
+    preflight[QStringLiteral("available")] = false;
+    preflight[QStringLiteral("action")] = QString();
+    preflight[QStringLiteral("command")] = QString();
+    preflight[QStringLiteral("message")] = QString();
+
+    if (!manager.isSupported()) {
+        preflight[QStringLiteral("message")] = QStringLiteral("USB passthrough is not supported on this client OS.");
+        return preflight;
+    }
+    if (manager.dependenciesReady()) {
+        preflight[QStringLiteral("available")] = true;
+        preflight[QStringLiteral("action")] = QStringLiteral("none");
+        preflight[QStringLiteral("message")] = QStringLiteral("USB passthrough dependencies are already ready.");
+        return preflight;
+    }
+
+#ifdef Q_OS_LINUX
+    if (manager.backend() == QStringLiteral("linux-usbip")) {
+        const QString modprobePath = QStandardPaths::findExecutable(
+            QStringLiteral("modprobe"),
+            {
+                QStringLiteral("/usr/sbin"),
+                QStringLiteral("/sbin"),
+                QStringLiteral("/usr/bin"),
+                QStringLiteral("/bin"),
+            });
+        const QString pkexecPath = QStandardPaths::findExecutable(QStringLiteral("pkexec"));
+        const bool runningAsRoot = geteuid() == 0;
+        preflight[QStringLiteral("modprobePath")] = modprobePath;
+        preflight[QStringLiteral("pkexecPath")] = pkexecPath;
+        preflight[QStringLiteral("runningAsRoot")] = runningAsRoot;
+        if (modprobePath.isEmpty()) {
+            preflight[QStringLiteral("message")] = QStringLiteral("modprobe was not found.");
+        }
+        else if (runningAsRoot) {
+            preflight[QStringLiteral("available")] = true;
+            preflight[QStringLiteral("action")] = QStringLiteral("modprobe");
+            preflight[QStringLiteral("command")] = modprobePath + QStringLiteral(" usbip-core usbip-host");
+            preflight[QStringLiteral("message")] = QStringLiteral("USB/IP kernel modules can be loaded directly.");
+        }
+        else if (!pkexecPath.isEmpty()) {
+            preflight[QStringLiteral("available")] = true;
+            preflight[QStringLiteral("action")] = QStringLiteral("pkexec-modprobe");
+            preflight[QStringLiteral("command")] = pkexecPath + QStringLiteral(" ") + modprobePath + QStringLiteral(" usbip-core usbip-host");
+            preflight[QStringLiteral("message")] = QStringLiteral("USB/IP kernel modules can be loaded through pkexec.");
+        }
+        else {
+            preflight[QStringLiteral("message")] = QStringLiteral("pkexec was not found. Run sudo modprobe usbip-core usbip-host.");
+        }
+        return preflight;
+    }
+#endif
+
+#ifdef Q_OS_WIN32
+    if (manager.backend() == QStringLiteral("windows-usbipd-win")) {
+        const QString wingetPath = QStandardPaths::findExecutable(QStringLiteral("winget"));
+        preflight[QStringLiteral("wingetPath")] = wingetPath;
+        preflight[QStringLiteral("packageId")] = QStringLiteral("dorssel.usbipd-win");
+        if (wingetPath.isEmpty()) {
+            preflight[QStringLiteral("message")] = QStringLiteral("winget was not found. Install usbipd-win from the official releases page.");
+        }
+        else {
+            preflight[QStringLiteral("available")] = true;
+            preflight[QStringLiteral("action")] = QStringLiteral("winget-usbipd-win");
+            preflight[QStringLiteral("command")] = wingetPath + QStringLiteral(" install --interactive --exact --id dorssel.usbipd-win --accept-package-agreements --accept-source-agreements");
+            preflight[QStringLiteral("message")] = QStringLiteral("usbipd-win can be installed through winget with administrator approval.");
+        }
+        return preflight;
+    }
+#endif
+
+    preflight[QStringLiteral("message")] = QStringLiteral("USB passthrough dependency installation is not supported on this client backend.");
+    return preflight;
+}
+
+static QString formatUsbLabInstallHuman(const UsbPassthroughManager& manager, const QVariantMap& preflight, bool dryRun, bool installAttempted, bool installStarted)
+{
+    QString output;
+    QTextStream stream(&output);
+    stream << "USB passthrough client dependency setup\n";
+    stream << "Dry run: " << usbLabYesNo(dryRun) << '\n';
+    stream << "Supported: " << usbLabYesNo(manager.isSupported()) << '\n';
+    stream << "Backend: " << usbLabValueOrDash(manager.backend()) << '\n';
+    stream << "Dependencies ready: " << usbLabYesNo(manager.dependenciesReady()) << '\n';
+    stream << "Install action available: " << usbLabYesNo(preflight.value(QStringLiteral("available")).toBool()) << '\n';
+    stream << "Install action: " << usbLabValueOrDash(preflight.value(QStringLiteral("action")).toString()) << '\n';
+    const QString command = preflight.value(QStringLiteral("command")).toString();
+    if (!command.isEmpty()) {
+        stream << "Install command: " << command << '\n';
+    }
+    stream << "Status: " << usbLabValueOrDash(manager.statusMessage()) << '\n';
+    if (!manager.lastError().isEmpty()) {
+        stream << "Last error: " << manager.lastError() << '\n';
+    }
+    const QString message = preflight.value(QStringLiteral("message")).toString();
+    if (!message.isEmpty()) {
+        stream << "Message: " << message << '\n';
+    }
+    if (installAttempted) {
+        stream << "Install attempted: yes\n";
+        stream << "Install started: " << usbLabYesNo(installStarted) << '\n';
+    }
+    return output;
+}
+
+static bool writeUsbLabCommandOutput(const QString& output, const QString& outputPath)
+{
+    const QString normalizedOutput = output.endsWith('\n') ? output : output + '\n';
+    if (!outputPath.isEmpty()) {
+        QFile file(outputPath);
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
+            std::cerr << "Failed to write " << qtToStdString(outputPath) << ": "
+                      << qtToStdString(file.errorString()) << std::endl;
+            return false;
+        }
+
+        file.write(normalizedOutput.toUtf8());
+        return true;
+    }
+
+    fputs(qPrintable(normalizedOutput), stdout);
+    fflush(stdout);
+    return true;
+}
+
+static bool writeUsbLabJsonState(const QVariantMap& payload, bool finalOutput, bool json, const QString& outputPath)
+{
+    if (outputPath.isEmpty() && !(json && finalOutput)) {
+        return true;
+    }
+
+    const QString output = QString::fromUtf8(
+        QJsonDocument(QJsonObject::fromVariantMap(payload)).toJson(QJsonDocument::Indented));
+
+    if (!outputPath.isEmpty() && !writeUsbLabCommandOutput(output, outputPath)) {
+        return false;
+    }
+
+    if (json && finalOutput) {
+        return writeUsbLabCommandOutput(output, QString());
+    }
+
+    return true;
+}
+
+static bool writeUsbLabTunnelState(const UsbLabTunnelCommandLineParser& parser, const QVariantMap& payload, bool finalOutput)
+{
+    return writeUsbLabJsonState(payload, finalOutput, parser.isJson(), parser.getOutputPath());
+}
+
+static bool writeUsbLabInstallState(const UsbLabInstallCommandLineParser& parser, const QVariantMap& payload, bool finalOutput)
+{
+    return writeUsbLabJsonState(payload, finalOutput, parser.isJson(), parser.getOutputPath());
+}
+
+static bool writeUsbLabExportState(const UsbLabExportCommandLineParser& parser, const QVariantMap& payload, bool finalOutput)
+{
+    return writeUsbLabJsonState(payload, finalOutput, parser.isJson(), parser.getOutputPath());
+}
+
+static int runUsbLabInstallCommand(const QStringList& args)
+{
+    UsbLabInstallCommandLineParser parser;
+    parser.parse(args);
+
+    UsbPassthroughManager manager;
+    manager.refresh();
+
+    const bool dependenciesReadyBefore = manager.dependenciesReady();
+    QVariantMap preflight = usbLabInstallPreflight(manager);
+    QVariantMap payload = usbLabStatusPayload(manager, false, false);
+    payload[QStringLiteral("command")] = QStringLiteral("usb-lab-install");
+    payload[QStringLiteral("state")] = QStringLiteral("starting");
+    payload[QStringLiteral("dryRun")] = parser.isDryRun();
+    payload[QStringLiteral("dependenciesReadyBefore")] = dependenciesReadyBefore;
+    payload[QStringLiteral("dependenciesReadyAfter")] = QVariant();
+    payload[QStringLiteral("installAction")] = preflight;
+    payload[QStringLiteral("installAttempted")] = false;
+    payload[QStringLiteral("installStarted")] = false;
+    payload[QStringLiteral("postStatus")] = QVariant();
+    payload[QStringLiteral("message")] = QVariant();
+    payload[QStringLiteral("exitCode")] = QVariant();
+
+    auto finish = [&](int exitCode, const QString& state, const QString& message, bool installAttempted, bool installStarted) -> int {
+        payload[QStringLiteral("state")] = state;
+        payload[QStringLiteral("message")] = message;
+        payload[QStringLiteral("installAttempted")] = installAttempted;
+        payload[QStringLiteral("installStarted")] = installStarted;
+        payload[QStringLiteral("dependenciesReadyAfter")] = manager.dependenciesReady();
+        payload[QStringLiteral("lastError")] = manager.lastError();
+        payload[QStringLiteral("statusMessage")] = manager.statusMessage();
+        payload[QStringLiteral("exitCode")] = exitCode;
+
+        if (parser.isJson()) {
+            return writeUsbLabInstallState(parser, payload, true) ? exitCode : 10;
+        }
+
+        const QString output = formatUsbLabInstallHuman(manager, preflight, parser.isDryRun(), installAttempted, installStarted);
+        return writeUsbLabCommandOutput(output, parser.getOutputPath()) ? exitCode : 10;
+    };
+
+    if (!manager.isSupported()) {
+        return finish(2, QStringLiteral("failed"), QStringLiteral("USB passthrough is not supported on this client OS."), false, false);
+    }
+
+    const bool installActionAvailable = preflight.value(QStringLiteral("available")).toBool();
+    if (parser.isDryRun()) {
+        if (dependenciesReadyBefore) {
+            return finish(0, QStringLiteral("ready"), QStringLiteral("USB passthrough dependencies are already ready."), false, false);
+        }
+        if (installActionAvailable) {
+            return finish(0, QStringLiteral("available"), preflight.value(QStringLiteral("message")).toString(), false, false);
+        }
+        return finish(3, QStringLiteral("failed"), preflight.value(QStringLiteral("message")).toString(), false, false);
+    }
+
+    if (dependenciesReadyBefore) {
+        return finish(0, QStringLiteral("ready"), QStringLiteral("USB passthrough dependencies are already ready."), false, false);
+    }
+
+    const bool installStarted = manager.installDependency();
+    manager.refresh();
+    payload[QStringLiteral("postStatus")] = usbLabStatusPayload(manager, false, false);
+
+    if (!installStarted) {
+        const QString message = manager.lastError().isEmpty() ? QStringLiteral("USB passthrough dependency setup failed.") : manager.lastError();
+        return finish(3, QStringLiteral("failed"), message, true, false);
+    }
+
+    const QString state = manager.dependenciesReady() ? QStringLiteral("ready") : QStringLiteral("started");
+    const QString message = manager.dependenciesReady() ?
+                                QStringLiteral("USB passthrough dependencies are ready.") :
+                                manager.statusMessage();
+    return finish(0, state, message, true, true);
+}
+
+static int runUsbLabListCommand(const QStringList& args)
+{
+    UsbLabListCommandLineParser parser;
+    parser.parse(args);
+
+    UsbPassthroughManager manager;
+    manager.refresh();
+
+    bool exporterReady = false;
+    if (parser.shouldTestExporter()) {
+        exporterReady = manager.testExporter();
+    }
+
+    QString output;
+    if (parser.isJson()) {
+        const QVariantMap payload = usbLabStatusPayload(manager, parser.shouldTestExporter(), exporterReady);
+        output = QString::fromUtf8(QJsonDocument(QJsonObject::fromVariantMap(payload)).toJson(QJsonDocument::Indented));
+    }
+    else {
+        output = formatUsbLabStatusHuman(manager, parser.shouldTestExporter(), exporterReady);
+    }
+
+    if (!writeUsbLabCommandOutput(output, parser.getOutputPath())) {
+        return 10;
+    }
+    if (!manager.isSupported()) {
+        return 2;
+    }
+    if (!manager.dependenciesReady()) {
+        return 3;
+    }
+    if (parser.shouldTestExporter() && !exporterReady) {
+        return 4;
+    }
+
+    return 0;
+}
+
+static int runUsbLabExportCommand(const QStringList& args)
+{
+    UsbLabExportCommandLineParser parser;
+    parser.parse(args);
+
+    UsbPassthroughManager manager;
+    manager.refresh();
+
+    const QString busId = parser.getBusId();
+    QVariantMap payload;
+    payload[QStringLiteral("command")] = QStringLiteral("usb-lab-export");
+    payload[QStringLiteral("state")] = QStringLiteral("starting");
+    payload[QStringLiteral("busid")] = busId;
+    payload[QStringLiteral("exporterPort")] = k_UsbLabDefaultExporterPort;
+    payload[QStringLiteral("holdSeconds")] = parser.getHoldSeconds() >= 0 ? QVariant(parser.getHoldSeconds()) : QVariant();
+    payload[QStringLiteral("bindRequested")] = parser.shouldBind();
+    payload[QStringLiteral("boundByCommand")] = false;
+    payload[QStringLiteral("supported")] = manager.isSupported();
+    payload[QStringLiteral("backend")] = manager.backend();
+    payload[QStringLiteral("dependenciesReady")] = manager.dependenciesReady();
+    payload[QStringLiteral("statusMessage")] = manager.statusMessage();
+    payload[QStringLiteral("exportServerStarted")] = false;
+    payload[QStringLiteral("deviceFound")] = false;
+    payload[QStringLiteral("exportableBeforeBind")] = false;
+    payload[QStringLiteral("exportableAfterBind")] = false;
+    payload[QStringLiteral("stopped")] = false;
+    payload[QStringLiteral("cleanupDetachOk")] = QVariant();
+    payload[QStringLiteral("cleanupUnbindOk")] = QVariant();
+    payload[QStringLiteral("lastError")] = manager.lastError();
+
+    auto finish = [&](int exitCode, const QString& state, const QString& message) -> int {
+        payload[QStringLiteral("state")] = state;
+        payload[QStringLiteral("message")] = message;
+        payload[QStringLiteral("lastError")] = manager.lastError();
+        payload[QStringLiteral("exitCode")] = exitCode;
+        return writeUsbLabExportState(parser, payload, true) ? exitCode : 10;
+    };
+
+    if (!manager.isSupported()) {
+        const QString message = QStringLiteral("USB passthrough is not supported on this client OS.");
+        std::cerr << qtToStdString(message) << std::endl;
+        return finish(2, QStringLiteral("failed"), message);
+    }
+    if (!manager.dependenciesReady()) {
+        const QString message = manager.statusMessage();
+        std::cerr << qtToStdString(message) << std::endl;
+        return finish(3, QStringLiteral("failed"), message);
+    }
+    if (!manager.startExportServer()) {
+        const QString message = manager.lastError();
+        std::cerr << qtToStdString(message) << std::endl;
+        return finish(4, QStringLiteral("failed"), message);
+    }
+    payload[QStringLiteral("exportServerStarted")] = true;
+
+    bool found = false;
+    bool exportable = usbLabDeviceExportable(manager, busId, &found);
+    bool boundByCommand = false;
+    payload[QStringLiteral("deviceFound")] = found;
+    payload[QStringLiteral("exportableBeforeBind")] = exportable;
+
+    if (!found) {
+        const QString message = QStringLiteral("USB device %1 was not found.").arg(busId);
+        std::cerr << qtToStdString(message) << std::endl;
+        manager.stopExportServer();
+        payload[QStringLiteral("exportServerStarted")] = false;
+        return finish(5, QStringLiteral("failed"), message);
+    }
+    if (!exportable && !parser.shouldBind()) {
+        const QString message = QStringLiteral("USB device %1 is not shared/exportable. Re-run with --bind to share it for this lab export.").arg(busId);
+        std::cerr << qtToStdString(message) << std::endl;
+        manager.stopExportServer();
+        payload[QStringLiteral("exportServerStarted")] = false;
+        return finish(6, QStringLiteral("failed"), message);
+    }
+    if (!exportable) {
+        if (!manager.bindDevice(busId)) {
+            const QString message = manager.lastError();
+            std::cerr << qtToStdString(message) << std::endl;
+            manager.stopExportServer();
+            payload[QStringLiteral("exportServerStarted")] = false;
+            return finish(7, QStringLiteral("failed"), message);
+        }
+        boundByCommand = true;
+        payload[QStringLiteral("boundByCommand")] = true;
+        manager.refresh();
+        exportable = usbLabDeviceExportable(manager, busId, &found);
+        payload[QStringLiteral("deviceFound")] = found;
+        payload[QStringLiteral("exportableAfterBind")] = exportable;
+        if (!found || !exportable) {
+            const bool unbindOk = manager.unbindDevice(busId);
+            payload[QStringLiteral("cleanupUnbindOk")] = unbindOk;
+            payload[QStringLiteral("boundByCommand")] = !unbindOk;
+            const QString message = QStringLiteral("USB device %1 was not exportable after binding.").arg(busId);
+            std::cerr << qtToStdString(message) << std::endl;
+            manager.stopExportServer();
+            payload[QStringLiteral("exportServerStarted")] = false;
+            return finish(8, QStringLiteral("failed"), message);
+        }
+    }
+    else {
+        payload[QStringLiteral("exportableAfterBind")] = true;
+    }
+
+    payload[QStringLiteral("state")] = QStringLiteral("ready");
+    payload[QStringLiteral("message")] = QStringLiteral("USB lab exporter is ready.");
+    payload[QStringLiteral("lastError")] = manager.lastError();
+    payload[QStringLiteral("exitCode")] = QVariant();
+    if (!writeUsbLabExportState(parser, payload, false)) {
+        const bool detachOk = manager.detachDevice(busId);
+        payload[QStringLiteral("cleanupDetachOk")] = detachOk;
+        if (boundByCommand) {
+            const bool unbindOk = manager.unbindDevice(busId);
+            payload[QStringLiteral("cleanupUnbindOk")] = unbindOk;
+            payload[QStringLiteral("boundByCommand")] = !unbindOk;
+        }
+        manager.stopExportServer();
+        payload[QStringLiteral("exportServerStarted")] = false;
+        return 10;
+    }
+
+    std::cout << "USB lab exporter ready for busid " << qtToStdString(busId)
+              << " on local USB/IP port " << k_UsbLabDefaultExporterPort << "." << std::endl;
+    std::cout << "Run host direct or broker attach while this process stays open." << std::endl;
+    if (parser.getHoldSeconds() >= 0) {
+        std::cout << "Exporter will stop automatically after " << parser.getHoldSeconds() << " seconds";
+        if (boundByCommand) {
+            std::cout << " and unshare the device";
+        }
+        std::cout << ". Press Ctrl+C to stop early." << std::endl;
+    }
+    else {
+        std::cout << "Press Enter or Ctrl+C to stop exporting";
+        if (boundByCommand) {
+            std::cout << " and unshare the device";
+        }
+        std::cout << "." << std::endl;
+    }
+
+    waitForUsbLabStop(parser.getHoldSeconds());
+    const bool detachOk = manager.detachDevice(busId);
+    payload[QStringLiteral("cleanupDetachOk")] = detachOk;
+    if (boundByCommand) {
+        const bool unbindOk = manager.unbindDevice(busId);
+        payload[QStringLiteral("cleanupUnbindOk")] = unbindOk;
+        payload[QStringLiteral("boundByCommand")] = !unbindOk;
+    }
+    manager.stopExportServer();
+    payload[QStringLiteral("exportServerStarted")] = false;
+    payload[QStringLiteral("stopped")] = true;
+
+    std::cout << "USB lab exporter stopped." << std::endl;
+    return finish(0, QStringLiteral("stopped"), QStringLiteral("USB lab exporter stopped."));
+}
+
+static int runUsbLabTunnelCommand(const QStringList& args)
+{
+    UsbLabTunnelCommandLineParser parser;
+    parser.parse(args);
+
+    UsbPassthroughManager manager;
+    manager.refresh();
+
+    QVariantMap payload;
+    payload[QStringLiteral("command")] = QStringLiteral("usb-lab-tunnel");
+    payload[QStringLiteral("state")] = QStringLiteral("starting");
+    payload[QStringLiteral("host")] = parser.getHost();
+    payload[QStringLiteral("hostPort")] = parser.getPort();
+    payload[QStringLiteral("busid")] = parser.getBusId();
+    payload[QStringLiteral("exporterPort")] = parser.getExporterPort();
+    payload[QStringLiteral("holdSeconds")] = parser.getHoldSeconds() >= 0 ? QVariant(parser.getHoldSeconds()) : QVariant();
+    payload[QStringLiteral("bindRequested")] = parser.shouldBind();
+    payload[QStringLiteral("boundByCommand")] = false;
+    payload[QStringLiteral("tokenPresent")] = !parser.getToken().isEmpty();
+    payload[QStringLiteral("tokenLength")] = parser.getToken().length();
+    payload[QStringLiteral("supported")] = manager.isSupported();
+    payload[QStringLiteral("backend")] = manager.backend();
+    payload[QStringLiteral("dependenciesReady")] = manager.dependenciesReady();
+    payload[QStringLiteral("statusMessage")] = manager.statusMessage();
+    payload[QStringLiteral("exportServerStarted")] = false;
+    payload[QStringLiteral("deviceFound")] = false;
+    payload[QStringLiteral("exportableBeforeBind")] = false;
+    payload[QStringLiteral("exportableAfterBind")] = false;
+    payload[QStringLiteral("tunnelConnected")] = false;
+    payload[QStringLiteral("stopped")] = false;
+    payload[QStringLiteral("cleanupDetachOk")] = QVariant();
+    payload[QStringLiteral("cleanupUnbindOk")] = QVariant();
+    payload[QStringLiteral("lastError")] = manager.lastError();
+
+    auto finish = [&](int exitCode, const QString& state, const QString& message) -> int {
+        payload[QStringLiteral("state")] = state;
+        payload[QStringLiteral("message")] = message;
+        payload[QStringLiteral("lastError")] = manager.lastError();
+        payload[QStringLiteral("exitCode")] = exitCode;
+        return writeUsbLabTunnelState(parser, payload, true) ? exitCode : 10;
+    };
+
+    if (!manager.isSupported()) {
+        const QString message = QStringLiteral("USB passthrough is not supported on this client OS.");
+        std::cerr << qtToStdString(message) << std::endl;
+        return finish(2, QStringLiteral("failed"), message);
+    }
+    if (!manager.dependenciesReady()) {
+        const QString message = manager.statusMessage();
+        std::cerr << qtToStdString(message) << std::endl;
+        return finish(3, QStringLiteral("failed"), message);
+    }
+    if (!manager.startExportServer()) {
+        const QString message = manager.lastError();
+        std::cerr << qtToStdString(message) << std::endl;
+        return finish(4, QStringLiteral("failed"), message);
+    }
+    payload[QStringLiteral("exportServerStarted")] = true;
+
+    const QString busId = parser.getBusId();
+    bool found = false;
+    bool exportable = usbLabDeviceExportable(manager, busId, &found);
+    bool boundByCommand = false;
+    payload[QStringLiteral("deviceFound")] = found;
+    payload[QStringLiteral("exportableBeforeBind")] = exportable;
+
+    if (!found) {
+        const QString message = QStringLiteral("USB device %1 was not found.").arg(busId);
+        std::cerr << qtToStdString(message) << std::endl;
+        manager.stopExportServer();
+        payload[QStringLiteral("exportServerStarted")] = false;
+        return finish(5, QStringLiteral("failed"), message);
+    }
+    if (!exportable && !parser.shouldBind()) {
+        const QString message = QStringLiteral("USB device %1 is not shared/exportable. Re-run with --bind to share it for this lab tunnel.").arg(busId);
+        std::cerr << qtToStdString(message) << std::endl;
+        manager.stopExportServer();
+        payload[QStringLiteral("exportServerStarted")] = false;
+        return finish(6, QStringLiteral("failed"), message);
+    }
+    if (!exportable) {
+        if (!manager.bindDevice(busId)) {
+            const QString message = manager.lastError();
+            std::cerr << qtToStdString(message) << std::endl;
+            manager.stopExportServer();
+            payload[QStringLiteral("exportServerStarted")] = false;
+            return finish(7, QStringLiteral("failed"), message);
+        }
+        boundByCommand = true;
+        payload[QStringLiteral("boundByCommand")] = true;
+        manager.refresh();
+        exportable = usbLabDeviceExportable(manager, busId, &found);
+        payload[QStringLiteral("deviceFound")] = found;
+        payload[QStringLiteral("exportableAfterBind")] = exportable;
+        if (!found || !exportable) {
+            if (boundByCommand) {
+                manager.unbindDevice(busId);
+                payload[QStringLiteral("cleanupUnbindOk")] = manager.lastError().isEmpty();
+                payload[QStringLiteral("boundByCommand")] = false;
+            }
+            const QString message = QStringLiteral("USB device %1 was not exportable after binding.").arg(busId);
+            std::cerr << qtToStdString(message) << std::endl;
+            manager.stopExportServer();
+            payload[QStringLiteral("exportServerStarted")] = false;
+            return finish(8, QStringLiteral("failed"), message);
+        }
+    }
+    else {
+        payload[QStringLiteral("exportableAfterBind")] = true;
+    }
+
+    std::cout << "Opening USB lab reverse tunnel for busid " << qtToStdString(busId)
+              << " to " << qtToStdString(parser.getHost()) << ":" << parser.getPort()
+              << " via local exporter port " << parser.getExporterPort() << std::endl;
+    if (!manager.startTunnel(parser.getHost(), parser.getPort(), parser.getToken(), busId, parser.getExporterPort())) {
+        const QString message = manager.lastError();
+        if (boundByCommand) {
+            const bool unbindOk = manager.unbindDevice(busId);
+            payload[QStringLiteral("cleanupUnbindOk")] = unbindOk;
+            payload[QStringLiteral("boundByCommand")] = !unbindOk;
+        }
+        manager.stopExportServer();
+        payload[QStringLiteral("exportServerStarted")] = false;
+        std::cerr << qtToStdString(message) << std::endl;
+        return finish(9, QStringLiteral("failed"), message);
+    }
+    payload[QStringLiteral("tunnelConnected")] = true;
+    payload[QStringLiteral("state")] = QStringLiteral("connected");
+    payload[QStringLiteral("message")] = QStringLiteral("USB lab reverse tunnel connected.");
+    payload[QStringLiteral("lastError")] = manager.lastError();
+    payload[QStringLiteral("exitCode")] = QVariant();
+    if (!writeUsbLabTunnelState(parser, payload, false)) {
+        manager.stopTunnels();
+        const bool detachOk = manager.detachDevice(busId);
+        payload[QStringLiteral("cleanupDetachOk")] = detachOk;
+        if (boundByCommand) {
+            const bool unbindOk = manager.unbindDevice(busId);
+            payload[QStringLiteral("cleanupUnbindOk")] = unbindOk;
+            payload[QStringLiteral("boundByCommand")] = !unbindOk;
+        }
+        manager.stopExportServer();
+        payload[QStringLiteral("exportServerStarted")] = false;
+        return 10;
+    }
+
+    if (parser.getHoldSeconds() >= 0) {
+        std::cout << "USB lab reverse tunnel connected for " << parser.getHoldSeconds()
+                  << " seconds while the host imports the device." << std::endl;
+        std::cout << "Press Ctrl+C to stop the tunnel early";
+        if (boundByCommand) {
+            std::cout << " and unshare the device";
+        }
+        std::cout << "." << std::endl;
+    }
+    else {
+        std::cout << "USB lab reverse tunnel connected. Keep this process running while the host imports the device." << std::endl;
+        std::cout << "Press Enter or Ctrl+C to stop the tunnel";
+        if (boundByCommand) {
+            std::cout << " and unshare the device";
+        }
+        std::cout << "." << std::endl;
+    }
+
+    waitForUsbLabStop(parser.getHoldSeconds());
+    manager.stopTunnels();
+    const bool detachOk = manager.detachDevice(busId);
+    payload[QStringLiteral("cleanupDetachOk")] = detachOk;
+    if (boundByCommand) {
+        const bool unbindOk = manager.unbindDevice(busId);
+        payload[QStringLiteral("cleanupUnbindOk")] = unbindOk;
+        payload[QStringLiteral("boundByCommand")] = !unbindOk;
+    }
+    manager.stopExportServer();
+    payload[QStringLiteral("exportServerStarted")] = false;
+    payload[QStringLiteral("tunnelConnected")] = false;
+    payload[QStringLiteral("stopped")] = true;
+
+    std::cout << "USB lab reverse tunnel stopped." << std::endl;
+    return finish(0, QStringLiteral("stopped"), QStringLiteral("USB lab reverse tunnel stopped."));
 }
 
 void sdlLogToDiskHandler(void*, int category, SDL_LogPriority priority, const char* message)
@@ -778,6 +1562,10 @@ int main(int argc, char *argv[])
     GlobalCommandLineParser::ParseResult commandLineParserResult = parser.parse(app.arguments());
     switch (commandLineParserResult) {
     case GlobalCommandLineParser::ListRequested:
+    case GlobalCommandLineParser::UsbLabInstallRequested:
+    case GlobalCommandLineParser::UsbLabListRequested:
+    case GlobalCommandLineParser::UsbLabExportRequested:
+    case GlobalCommandLineParser::UsbLabTunnelRequested:
         // Don't log to the console since it will jumble the command output
         s_SuppressVerboseOutput = true;
         break;
@@ -900,6 +1688,11 @@ int main(int argc, char *argv[])
                                                    [](QQmlEngine* qmlEngine, QJSEngine*) -> QObject* {
                                                        return StreamingPreferences::get(qmlEngine);
                                                    });
+    qmlRegisterSingletonType<UsbPassthroughManager>("UsbPassthrough", 1, 0,
+                                                    "UsbPassthroughManager",
+                                                    [](QQmlEngine* qmlEngine, QJSEngine*) -> QObject* {
+                                                        return UsbPassthroughManager::get(qmlEngine);
+                                                    });
 
     // Create the identity manager on the main thread
     IdentityManager::get();
@@ -927,6 +1720,8 @@ int main(int argc, char *argv[])
     QQmlApplicationEngine engine;
     QString initialView;
     bool hasGUI = true;
+    bool exitAfterCommand = false;
+    int commandExitCode = 0;
 
     switch (commandLineParserResult) {
     case GlobalCommandLineParser::NormalStartRequested:
@@ -971,6 +1766,34 @@ int main(int argc, char *argv[])
             hasGUI = false;
             break;
         }
+    case GlobalCommandLineParser::UsbLabListRequested:
+        {
+            commandExitCode = runUsbLabListCommand(app.arguments());
+            exitAfterCommand = true;
+            hasGUI = false;
+            break;
+        }
+    case GlobalCommandLineParser::UsbLabInstallRequested:
+        {
+            commandExitCode = runUsbLabInstallCommand(app.arguments());
+            exitAfterCommand = true;
+            hasGUI = false;
+            break;
+        }
+    case GlobalCommandLineParser::UsbLabExportRequested:
+        {
+            commandExitCode = runUsbLabExportCommand(app.arguments());
+            exitAfterCommand = true;
+            hasGUI = false;
+            break;
+        }
+    case GlobalCommandLineParser::UsbLabTunnelRequested:
+        {
+            commandExitCode = runUsbLabTunnelCommand(app.arguments());
+            exitAfterCommand = true;
+            hasGUI = false;
+            break;
+        }
     }
 
     if (hasGUI) {
@@ -983,7 +1806,7 @@ int main(int argc, char *argv[])
             return -1;
     }
 
-    int err = app.exec();
+    int err = exitAfterCommand ? commandExitCode : app.exec();
 
     // Give worker tasks time to properly exit. Fixes PendingQuitTask
     // sometimes freezing and blocking process exit.

@@ -14,6 +14,10 @@ public:
         QuitRequested,
         PairRequested,
         ListRequested,
+        UsbLabInstallRequested,
+        UsbLabListRequested,
+        UsbLabExportRequested,
+        UsbLabTunnelRequested,
     };
 
     GlobalCommandLineParser();
@@ -90,4 +94,92 @@ private:
     QString m_Host;
     bool m_PrintCSV;
     bool m_Verbose;
+};
+
+class UsbLabTunnelCommandLineParser
+{
+public:
+    UsbLabTunnelCommandLineParser();
+    virtual ~UsbLabTunnelCommandLineParser();
+
+    void parse(const QStringList &args);
+
+    QString getHost() const;
+    quint16 getPort() const;
+    QString getToken() const;
+    QString getBusId() const;
+    quint16 getExporterPort() const;
+    int getHoldSeconds() const;
+    bool shouldBind() const;
+    bool isJson() const;
+    QString getOutputPath() const;
+
+private:
+    QString m_Host;
+    quint16 m_Port;
+    QString m_Token;
+    QString m_BusId;
+    quint16 m_ExporterPort;
+    int m_HoldSeconds;
+    bool m_Bind;
+    bool m_Json;
+    QString m_OutputPath;
+};
+
+class UsbLabInstallCommandLineParser
+{
+public:
+    UsbLabInstallCommandLineParser();
+    virtual ~UsbLabInstallCommandLineParser();
+
+    void parse(const QStringList &args);
+
+    bool isDryRun() const;
+    bool isJson() const;
+    QString getOutputPath() const;
+
+private:
+    bool m_DryRun;
+    bool m_Json;
+    QString m_OutputPath;
+};
+
+class UsbLabExportCommandLineParser
+{
+public:
+    UsbLabExportCommandLineParser();
+    virtual ~UsbLabExportCommandLineParser();
+
+    void parse(const QStringList &args);
+
+    QString getBusId() const;
+    int getHoldSeconds() const;
+    bool shouldBind() const;
+    bool isJson() const;
+    QString getOutputPath() const;
+
+private:
+    QString m_BusId;
+    int m_HoldSeconds;
+    bool m_Bind;
+    bool m_Json;
+    QString m_OutputPath;
+};
+
+class UsbLabListCommandLineParser
+{
+public:
+    UsbLabListCommandLineParser();
+    virtual ~UsbLabListCommandLineParser();
+
+    void parse(const QStringList &args);
+
+    bool isJson() const;
+    bool shouldTestExporter() const;
+    QString getOutputPath() const;
+
+private:
+    bool m_Json;
+    bool m_TestExporter;
+    QString m_OutputPath;
 };

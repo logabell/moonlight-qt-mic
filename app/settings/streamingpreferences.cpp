@@ -46,7 +46,10 @@
 #define SER_DETECTNETBLOCKING "detectnetblocking"
 #define SER_SHOWPERFOVERLAY "showperfoverlay"
 #define SER_ENABLEMICROPHONE "enablemicrophone"
+#define SER_ENABLEUSBPASSTHROUGH "enableusbpassthrough"
+#define SER_ALLOWUSBSTORAGEPASSTHROUGH "allowusbstoragepassthrough"
 #define SER_MICROPHONEDEVICE "microphonedevice"
+#define SER_USBPASSTHROUGHDEVICES "usbpassthroughdevices"
 #define SER_SWAPMOUSEBUTTONS "swapmousebuttons"
 #define SER_MUTEONFOCUSLOSS "muteonfocusloss"
 #define SER_BACKGROUNDGAMEPAD "backgroundgamepad"
@@ -162,7 +165,10 @@ void StreamingPreferences::reload()
     detectNetworkBlocking = settings.value(SER_DETECTNETBLOCKING, true).toBool();
     showPerformanceOverlay = settings.value(SER_SHOWPERFOVERLAY, false).toBool();
     enableMicrophone = settings.value(SER_ENABLEMICROPHONE, false).toBool();
+    enableUsbPassthrough = settings.value(SER_ENABLEUSBPASSTHROUGH, false).toBool();
+    allowUsbStoragePassthrough = settings.value(SER_ALLOWUSBSTORAGEPASSTHROUGH, false).toBool();
     microphoneDevice = settings.value(SER_MICROPHONEDEVICE, "").toString();
+    usbPassthroughDevices = settings.value(SER_USBPASSTHROUGHDEVICES).toStringList();
     packetSize = settings.value(SER_PACKETSIZE, 0).toInt();
     swapMouseButtons = settings.value(SER_SWAPMOUSEBUTTONS, false).toBool();
     muteOnFocusLoss = settings.value(SER_MUTEONFOCUSLOSS, false).toBool();
@@ -365,7 +371,10 @@ void StreamingPreferences::save()
     settings.setValue(SER_DETECTNETBLOCKING, detectNetworkBlocking);
     settings.setValue(SER_SHOWPERFOVERLAY, showPerformanceOverlay);
     settings.setValue(SER_ENABLEMICROPHONE, enableMicrophone);
+    settings.setValue(SER_ENABLEUSBPASSTHROUGH, enableUsbPassthrough);
+    settings.setValue(SER_ALLOWUSBSTORAGEPASSTHROUGH, allowUsbStoragePassthrough);
     settings.setValue(SER_MICROPHONEDEVICE, microphoneDevice);
+    settings.setValue(SER_USBPASSTHROUGHDEVICES, usbPassthroughDevices);
     settings.setValue(SER_AUDIOCFG, static_cast<int>(audioConfig));
     settings.setValue(SER_HDR, enableHdr);
     settings.setValue(SER_YUV444, enableYUV444);

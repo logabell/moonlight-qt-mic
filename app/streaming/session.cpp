@@ -1,6 +1,7 @@
 #include "session.h"
 #include "settings/streamingpreferences.h"
 #include "streaming/streamutils.h"
+#include "streaming/usb/usbpassthroughmanager.h"
 #include "backend/richpresencemanager.h"
 #include "streaming/audio/capture/microphonecapture.h"
 
@@ -34,6 +35,7 @@
 
 #include <QtEndian>
 #include <QCoreApplication>
+#include <QDebug>
 #include <QThreadPool>
 #include <QSvgRenderer>
 #include <QPainter>
@@ -41,6 +43,11 @@
 #include <QGuiApplication>
 #include <QCursor>
 #include <QScreen>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QUrl>
+#include <QVariantMap>
 
 #if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
 #include <QQuickOpenGLUtils>
@@ -66,6 +73,68 @@ CONNECTION_LISTENER_CALLBACKS Session::k_ConnCallbacks = {
 
 Session* Session::s_ActiveSession;
 QSemaphore Session::s_ActiveSessionSemaphore(1);
+
+static void addUsbString(QJsonObject& object, const QVariantMap& source, const QString& key)
+{
+    if (source.contains(key)) {
+        object.insert(key, source.value(key).toString());
+    }
+}
+
+static void addUsbBool(QJsonObject& object, const QVariantMap& source, const QString& key, bool defaultValue = false)
+{
+    object.insert(key, source.contains(key) ? source.value(key).toBool() : defaultValue);
+}
+
+static void addUsbStringList(QJsonObject& object, const QVariantMap& source, const QString& key)
+{
+    QJsonArray array;
+    for (const QString& value : source.value(key).toStringList()) {
+        array.append(value);
+    }
+    object.insert(key, array);
+}
+
+static bool isUsbDeviceExportableForLaunch(const QVariantMap& device)
+{
+    const QString state = device.value(QStringLiteral("state")).toString();
+    return state == QStringLiteral("bound") || device.value(QStringLiteral("bound")).toBool();
+}
+
+static QStringList usbDeviceSelectionKeys(const QVariantMap& device)
+{
+    QStringList keys;
+    const QString approvalId = device.value(QStringLiteral("approvalId")).toString();
+    const QString busId = device.value(QStringLiteral("busid")).toString();
+
+    if (!approvalId.isEmpty()) {
+        keys.append(approvalId);
+    }
+    if (!busId.isEmpty() && !keys.contains(busId)) {
+        keys.append(busId);
+    }
+    return keys;
+}
+
+static bool isUsbDeviceSelectedForLaunch(const QVariantMap& device, const QStringList& selectedDevices)
+{
+    for (const QString& key : usbDeviceSelectionKeys(device)) {
+        if (selectedDevices.contains(key)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool isUsbDeviceBlockedForLaunch(const QVariantMap& device, const StreamingPreferences* preferences)
+{
+    if (!device.value(QStringLiteral("blocked")).toBool()) {
+        return false;
+    }
+    return !(device.value(QStringLiteral("storageClass")).toBool() &&
+             preferences &&
+             preferences->allowUsbStoragePassthrough);
+}
 
 void Session::clStageStarting(int stage)
 {
@@ -1290,6 +1359,8 @@ private:
         // Finish cleanup of the connection state
         LiStopConnection();
 
+        m_Session->cleanupUsbPassthroughDevices();
+
         // Perform a best-effort app quit
         if (shouldQuit) {
             NvHTTP http(m_Session->m_Computer);
@@ -1605,6 +1676,10 @@ bool Session::startConnectionAsync()
     }
 
     QString rtspSessionUrl;
+    QString usbTunnelMode;
+    QString usbTunnelToken;
+    quint16 usbTunnelPort = 0;
+    quint16 usbExporterPort = 3240;
 
     try {
         NvHTTP http(m_Computer);
@@ -1615,13 +1690,44 @@ bool Session::startConnectionAsync()
                       m_Preferences->playAudioOnHost,
                       m_InputHandler->getAttachedGamepadMask(),
                       !m_Preferences->multiController,
-                      rtspSessionUrl);
+                      rtspSessionUrl,
+                      buildUsbPassthroughLaunchParameters(),
+                      &usbTunnelMode,
+                      &usbTunnelPort,
+                      &usbTunnelToken,
+                      &usbExporterPort);
     } catch (const GfeHttpResponseException& e) {
         emit displayLaunchError(tr("Host returned error: %1").arg(e.toQString()));
         return false;
     } catch (const QtNetworkReplyException& e) {
         emit displayLaunchError(e.toQString());
         return false;
+    }
+
+    const bool hasActiveUsbDevices = !m_ActiveUsbPassthroughDevices.isEmpty();
+    const bool hostProvidedUsbTunnel = usbTunnelMode == QStringLiteral("reverse-tcp-v1") &&
+            usbTunnelPort != 0 &&
+            !usbTunnelToken.isEmpty();
+    if (hostProvidedUsbTunnel && hasActiveUsbDevices) {
+        UsbPassthroughManager manager;
+        bool startedAllUsbTunnels = true;
+        for (const QString& busId : m_ActiveUsbPassthroughDevices) {
+            if (!manager.startTunnel(m_Computer->activeAddress.address(), usbTunnelPort, usbTunnelToken, busId, usbExporterPort)) {
+                qWarning() << "Failed to start USB passthrough tunnel for" << busId << manager.lastError();
+                startedAllUsbTunnels = false;
+                break;
+            }
+        }
+        if (!startedAllUsbTunnels) {
+            qWarning() << "USB passthrough disabled for this stream because a reverse tunnel failed to start";
+            cleanupUsbPassthroughDevices();
+            emitLaunchWarning(tr("USB passthrough was disabled for this stream because the USB tunnel could not be started."));
+        }
+    }
+    else if (hasActiveUsbDevices) {
+        qWarning() << "USB passthrough disabled for this stream because the host did not provide a reverse tunnel";
+        cleanupUsbPassthroughDevices();
+        emitLaunchWarning(tr("USB passthrough was disabled for this stream because the host did not provide a USB tunnel."));
     }
 
     QByteArray hostnameStr = m_Computer->activeAddress.address().toUtf8();
@@ -1711,6 +1817,191 @@ bool Session::startConnectionAsync()
 
     emit connectionStarted();
     return true;
+}
+
+QString Session::buildUsbPassthroughLaunchParameters()
+{
+    if (!m_Preferences || !m_Preferences->enableUsbPassthrough) {
+        m_ActiveUsbPassthroughDevices.clear();
+        m_BoundUsbPassthroughDevices.clear();
+        return QString();
+    }
+
+    UsbPassthroughManager manager;
+    const QStringList selectedDevices = m_Preferences->usbPassthroughDevices;
+    QStringList boundByThisLaunch;
+    QStringList allowedDevices;
+    for (const QVariant& deviceVariant : manager.devices()) {
+        const QVariantMap device = deviceVariant.toMap();
+        const QString busId = device.value(QStringLiteral("busid")).toString();
+        if (!busId.isEmpty() &&
+                isUsbDeviceSelectedForLaunch(device, selectedDevices) &&
+                !isUsbDeviceBlockedForLaunch(device, m_Preferences)) {
+            allowedDevices.append(busId);
+        }
+    }
+    QJsonArray devices;
+    bool exporterReady = manager.dependenciesReady();
+
+    if (!allowedDevices.isEmpty() && manager.dependenciesReady()) {
+        exporterReady = manager.startExportServer();
+        if (!exporterReady) {
+            qWarning() << "USB passthrough exporter failed to start" << manager.lastError();
+        }
+
+        if (exporterReady) {
+            const QVariantList currentDevices = manager.devices();
+            for (const QString& selectedBusId : allowedDevices) {
+                bool found = false;
+                bool shouldBind = false;
+                for (const QVariant& deviceVariant : currentDevices) {
+                    const QVariantMap device = deviceVariant.toMap();
+                    if (device.value(QStringLiteral("busid")).toString() != selectedBusId) {
+                        continue;
+                    }
+                    found = true;
+                    if (isUsbDeviceBlockedForLaunch(device, m_Preferences)) {
+                        shouldBind = false;
+                        break;
+                    }
+
+                    shouldBind = !isUsbDeviceExportableForLaunch(device);
+                    break;
+                }
+
+                if (!found) {
+                    qWarning() << "USB passthrough selected device disappeared before launch" << selectedBusId;
+                    continue;
+                }
+                if (shouldBind && !manager.bindDevice(selectedBusId)) {
+                    qWarning() << "USB passthrough failed to bind selected device"
+                               << selectedBusId << manager.lastError();
+                }
+                else if (shouldBind) {
+                    boundByThisLaunch.append(selectedBusId);
+                }
+            }
+
+            manager.refresh();
+        }
+    }
+    else if (!allowedDevices.isEmpty()) {
+        qWarning() << "USB passthrough dependencies are not ready" << manager.statusMessage();
+    }
+
+    QStringList exportedDevices;
+    if (exporterReady) {
+        for (const QVariant& deviceVariant : manager.devices()) {
+            const QVariantMap device = deviceVariant.toMap();
+            const QString busId = device.value(QStringLiteral("busid")).toString();
+            if (busId.isEmpty() || !allowedDevices.contains(busId) || isUsbDeviceBlockedForLaunch(device, m_Preferences)) {
+                continue;
+            }
+            if (!isUsbDeviceExportableForLaunch(device)) {
+                qWarning() << "USB passthrough selected device is not exportable after bind attempt"
+                           << busId << device.value(QStringLiteral("state")).toString();
+                continue;
+            }
+
+            exportedDevices.append(busId);
+        }
+    }
+
+    QStringList retainedBoundDevices;
+    for (const QString& busId : boundByThisLaunch) {
+        if (exportedDevices.contains(busId)) {
+            retainedBoundDevices.append(busId);
+        }
+        else {
+            manager.unbindDevice(busId);
+        }
+    }
+    m_ActiveUsbPassthroughDevices = exportedDevices;
+    m_BoundUsbPassthroughDevices = retainedBoundDevices;
+    if (!allowedDevices.isEmpty() && exportedDevices.isEmpty()) {
+        manager.stopExportServer();
+    }
+
+    for (const QVariant& deviceVariant : manager.devices()) {
+        const QVariantMap device = deviceVariant.toMap();
+        const QString busId = device.value(QStringLiteral("busid")).toString();
+        if (busId.isEmpty() || !exportedDevices.contains(busId) || isUsbDeviceBlockedForLaunch(device, m_Preferences)) {
+            continue;
+        }
+
+        QJsonObject object;
+        const bool blockedForLaunch = isUsbDeviceBlockedForLaunch(device, m_Preferences);
+        addUsbString(object, device, QStringLiteral("id"));
+        addUsbString(object, device, QStringLiteral("approvalId"));
+        addUsbString(object, device, QStringLiteral("busid"));
+        addUsbString(object, device, QStringLiteral("vid"));
+        addUsbString(object, device, QStringLiteral("pid"));
+        addUsbString(object, device, QStringLiteral("vendor"));
+        addUsbString(object, device, QStringLiteral("product"));
+        addUsbString(object, device, QStringLiteral("description"));
+        addUsbString(object, device, QStringLiteral("serialHash"));
+        addUsbBool(object, device, QStringLiteral("serialPresent"));
+        addUsbString(object, device, QStringLiteral("deviceClass"));
+        addUsbStringList(object, device, QStringLiteral("interfaces"));
+        addUsbBool(object, device, QStringLiteral("storageClass"));
+        object.insert(QStringLiteral("blocked"), blockedForLaunch);
+        if (blockedForLaunch) {
+            addUsbString(object, device, QStringLiteral("blockReason"));
+        }
+        addUsbString(object, device, QStringLiteral("speed"));
+        addUsbString(object, device, QStringLiteral("clientOs"));
+        addUsbString(object, device, QStringLiteral("backend"));
+        addUsbString(object, device, QStringLiteral("driver"));
+        addUsbString(object, device, QStringLiteral("state"));
+        addUsbBool(object, device, QStringLiteral("requiresAdmin"));
+        addUsbBool(object, device, QStringLiteral("approvalStable"));
+        addUsbBool(object, device, QStringLiteral("connected"), true);
+        addUsbBool(object, device, QStringLiteral("bound"));
+        addUsbBool(object, device, QStringLiteral("attached"));
+        addUsbBool(object, device, QStringLiteral("forced"));
+        object.insert(QStringLiteral("selected"), true);
+
+        if (object.value(QStringLiteral("backend")).toString().isEmpty()) {
+            object.insert(QStringLiteral("backend"), manager.backend());
+        }
+
+        devices.append(object);
+    }
+
+    const QString backend = manager.backend();
+    const QString encodedBackend = QString::fromLatin1(QUrl::toPercentEncoding(backend));
+    const QString encodedDevices = QString::fromLatin1(QUrl::toPercentEncoding(QString::fromUtf8(QJsonDocument(devices).toJson(QJsonDocument::Compact))));
+
+    return QStringLiteral("&usbPassthrough=1"
+                          "&usbPassthroughBackend=%1"
+                          "&usbPassthroughReady=%2"
+                          "&usbPassthroughDevices=%3")
+        .arg(encodedBackend,
+             exporterReady && (allowedDevices.isEmpty() || !exportedDevices.isEmpty()) ? QStringLiteral("1") : QStringLiteral("0"),
+             encodedDevices);
+}
+
+void Session::cleanupUsbPassthroughDevices()
+{
+    UsbPassthroughManager manager;
+    if (m_ActiveUsbPassthroughDevices.isEmpty() && m_BoundUsbPassthroughDevices.isEmpty()) {
+        manager.stopTunnels();
+        manager.stopExportServer();
+        return;
+    }
+
+    manager.stopTunnels();
+    const QStringList activeDevices = m_ActiveUsbPassthroughDevices;
+    for (const QString& busId : activeDevices) {
+        manager.detachDevice(busId);
+    }
+    const QStringList boundDevices = m_BoundUsbPassthroughDevices;
+    for (const QString& busId : boundDevices) {
+        manager.unbindDevice(busId);
+    }
+    manager.stopExportServer();
+    m_ActiveUsbPassthroughDevices.clear();
+    m_BoundUsbPassthroughDevices.clear();
 }
 
 void Session::flushWindowEvents()
@@ -1809,6 +2100,7 @@ void Session::exec()
 {
     // If the connection failed, clean up and abort the connection.
     if (!m_AsyncConnectionSuccess) {
+        cleanupUsbPassthroughDevices();
         destroyMicrophoneCapture();
         delete m_InputHandler;
         m_InputHandler = nullptr;

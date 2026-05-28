@@ -46,7 +46,7 @@ win32 {
     }
 
     INCLUDEPATH += $$PWD/../libs/windows/include
-    LIBS += ws2_32.lib winmm.lib dxva2.lib ole32.lib gdi32.lib user32.lib d3d9.lib dwmapi.lib dbghelp.lib
+    LIBS += ws2_32.lib winmm.lib dxva2.lib ole32.lib gdi32.lib user32.lib d3d9.lib dwmapi.lib dbghelp.lib Advapi32.lib
 }
 macx:!disable-prebuilts {
     INCLUDEPATH += $$PWD/../libs/mac/include $$PWD/../libs/mac/include/SDL2
@@ -187,6 +187,7 @@ SOURCES += \
     streaming/audio/audio.cpp \
     streaming/audio/capture/microphonecapture.cpp \
     streaming/audio/renderers/sdlaud.cpp \
+    streaming/usb/usbpassthroughmanager.cpp \
     gui/computermodel.cpp \
     gui/appmodel.cpp \
     streaming/bandwidth.cpp \
@@ -225,6 +226,7 @@ HEADERS += \
     streaming/audio/capture/microphonecapture.h \
     streaming/audio/renderers/renderer.h \
     streaming/audio/renderers/sdl.h \
+    streaming/usb/usbpassthroughmanager.h \
     gui/computermodel.h \
     gui/appmodel.h \
     streaming/video/decoder.h \

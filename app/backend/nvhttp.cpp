@@ -194,12 +194,21 @@ NvHTTP::startApp(QString verb,
                  bool localAudio,
                  int gamepadMask,
                  bool persistGameControllersOnDisconnect,
-                 QString& rtspSessionUrl)
+                 QString& rtspSessionUrl,
+                 QString extraLaunchParameters,
+                 QString* usbPassthroughTunnelMode,
+                 quint16* usbPassthroughTunnelPort,
+                 QString* usbPassthroughTunnelToken,
+                 quint16* usbPassthroughExporterPort)
 {
     int riKeyId;
 
     memcpy(&riKeyId, streamConfig->remoteInputAesIv, sizeof(riKeyId));
     riKeyId = qFromBigEndian(riKeyId);
+
+    if (!extraLaunchParameters.isEmpty() && !extraLaunchParameters.startsWith(QLatin1Char('&'))) {
+        extraLaunchParameters.prepend(QLatin1Char('&'));
+    }
 
     QString response =
             openConnectionToString(m_BaseUrlHttps,
@@ -223,6 +232,7 @@ NvHTTP::startApp(QString verb,
                                    "&remoteControllersBitmap="+QString::number(gamepadMask)+
                                    "&gcmap="+QString::number(gamepadMask)+
                                    "&gcpersist="+QString::number(persistGameControllersOnDisconnect ? 1 : 0)+
+                                   extraLaunchParameters+
                                    LiGetLaunchUrlQueryParameters(),
                                    LAUNCH_TIMEOUT_MS);
 
@@ -232,6 +242,19 @@ NvHTTP::startApp(QString verb,
     verifyResponseStatus(response);
 
     rtspSessionUrl = getXmlString(response, "sessionUrl0");
+    if (usbPassthroughTunnelMode) {
+        *usbPassthroughTunnelMode = getXmlString(response, "usbPassthroughTunnelMode");
+    }
+    if (usbPassthroughTunnelPort) {
+        *usbPassthroughTunnelPort = getXmlString(response, "usbPassthroughTunnelPort").toUShort();
+    }
+    if (usbPassthroughTunnelToken) {
+        *usbPassthroughTunnelToken = getXmlString(response, "usbPassthroughTunnelToken");
+    }
+    if (usbPassthroughExporterPort) {
+        const quint16 exporterPort = getXmlString(response, "usbPassthroughTunnelExporterPort").toUShort();
+        *usbPassthroughExporterPort = exporterPort == 0 ? 3240 : exporterPort;
+    }
 }
 
 void

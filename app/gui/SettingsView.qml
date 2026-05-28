@@ -7,6 +7,7 @@ import StreamingPreferences 1.0
 import ComputerManager 1.0
 import SdlGamepadKeyNavigation 1.0
 import SystemProperties 1.0
+import UsbPassthrough 1.0
 
 Flickable {
     id: settingsPage
@@ -35,6 +36,220 @@ Flickable {
             item = item.parent
         }
         return false
+    }
+
+    function usbDeviceName(device) {
+        if (!device) {
+            return qsTr("Unknown USB device")
+        }
+
+        if (device.product && device.vendor) {
+            return device.vendor + " " + device.product
+        }
+        if (device.product) {
+            return device.product
+        }
+        if (device.description) {
+            return device.description
+        }
+        return qsTr("USB device")
+    }
+
+    function usbDeviceDetails(device) {
+        if (!device) {
+            return ""
+        }
+
+        var parts = []
+        if (device.busid) {
+            parts.push(qsTr("Bus") + " " + device.busid)
+        }
+        if (device.vid && device.pid) {
+            parts.push(device.vid + ":" + device.pid)
+        }
+        if (device.deviceClass && device.deviceClass !== "unknown") {
+            parts.push(device.deviceClass)
+        }
+        if (device.storageClass && (!device.deviceClass || device.deviceClass === "unknown")) {
+            parts.push(qsTr("storage"))
+        }
+        if (device.driver) {
+            parts.push(device.driver)
+        }
+        if (device.requiresAdmin) {
+            parts.push(qsTr("admin"))
+        }
+        return parts.join(" | ")
+    }
+
+    function usbDeviceStateLabel(device) {
+        if (!device || !device.state) {
+            return qsTr("Unknown")
+        }
+
+        if (isUsbDeviceBlocked(device)) {
+            return qsTr("Blocked")
+        }
+        if (device.state === "attached") {
+            return qsTr("Attached")
+        }
+        if (device.state === "bound") {
+            return qsTr("Shared")
+        }
+        if (device.state === "available") {
+            return qsTr("Available")
+        }
+        if (device.state === "disconnected") {
+            return qsTr("Disconnected")
+        }
+        return device.state
+    }
+
+    function usbDeviceError(device) {
+        if (!device || !device.busid || !UsbPassthroughManager.deviceErrors) {
+            return ""
+        }
+
+        return UsbPassthroughManager.deviceErrors[device.busid] || ""
+    }
+
+    function usbDeviceSelectionKeys(device) {
+        var keys = []
+        if (!device) {
+            return keys
+        }
+        if (device.approvalId) {
+            keys.push(device.approvalId)
+        }
+        if (device.busid && keys.indexOf(device.busid) === -1) {
+            keys.push(device.busid)
+        }
+        return keys
+    }
+
+    function usbDevicePrimarySelectionKey(device) {
+        if (!device) {
+            return ""
+        }
+        return device.approvalId || device.busid || ""
+    }
+
+    function usbSelectionListContainsAny(list, keys) {
+        for (var i = 0; i < keys.length; i++) {
+            if (list.indexOf(keys[i]) !== -1) {
+                return true
+            }
+        }
+        return false
+    }
+
+    function isUsbDeviceSelected(device) {
+        return usbSelectionListContainsAny(StreamingPreferences.usbPassthroughDevices, usbDeviceSelectionKeys(device))
+    }
+
+    function isUsbDeviceBlocked(device) {
+        if (!device || !device.blocked) {
+            return false
+        }
+        if (device.storageClass && StreamingPreferences.allowUsbStoragePassthrough) {
+            return false
+        }
+        return true
+    }
+
+    function usbSelectionListsEqual(left, right) {
+        if (left.length !== right.length) {
+            return false
+        }
+        for (var i = 0; i < left.length; i++) {
+            if (left[i] !== right[i]) {
+                return false
+            }
+        }
+        return true
+    }
+
+    function normalizeUsbDeviceSelections() {
+        var current = []
+        for (var i = 0; i < StreamingPreferences.usbPassthroughDevices.length; i++) {
+            current.push(StreamingPreferences.usbPassthroughDevices[i])
+        }
+
+        var normalized = []
+        for (var j = 0; j < current.length; j++) {
+            var matchedCurrentDevice = false
+            for (var k = 0; k < UsbPassthroughManager.devices.length; k++) {
+                if (usbDeviceSelectionKeys(UsbPassthroughManager.devices[k]).indexOf(current[j]) !== -1) {
+                    matchedCurrentDevice = true
+                    break
+                }
+            }
+            if (!matchedCurrentDevice && normalized.indexOf(current[j]) === -1) {
+                normalized.push(current[j])
+            }
+        }
+
+        for (var deviceIndex = 0; deviceIndex < UsbPassthroughManager.devices.length; deviceIndex++) {
+            var device = UsbPassthroughManager.devices[deviceIndex]
+            var keys = usbDeviceSelectionKeys(device)
+            if (!usbSelectionListContainsAny(current, keys) || isUsbDeviceBlocked(device)) {
+                continue
+            }
+
+            var primaryKey = usbDevicePrimarySelectionKey(device)
+            if (primaryKey && normalized.indexOf(primaryKey) === -1) {
+                normalized.push(primaryKey)
+            }
+        }
+
+        if (!usbSelectionListsEqual(current, normalized)) {
+            StreamingPreferences.usbPassthroughDevices = normalized
+        }
+    }
+
+    function setUsbDeviceSelected(device, selected) {
+        if (!device || !device.busid) {
+            return
+        }
+        if (isUsbDeviceBlocked(device)) {
+            selected = false
+        }
+
+        var devices = []
+        for (var i = 0; i < StreamingPreferences.usbPassthroughDevices.length; i++) {
+            devices.push(StreamingPreferences.usbPassthroughDevices[i])
+        }
+
+        var selectionKeys = usbDeviceSelectionKeys(device)
+        for (var keyIndex = devices.length - 1; keyIndex >= 0; keyIndex--) {
+            if (selectionKeys.indexOf(devices[keyIndex]) !== -1) {
+                devices.splice(keyIndex, 1)
+            }
+        }
+
+        var primaryKey = usbDevicePrimarySelectionKey(device)
+        if (selected && primaryKey) {
+            devices.push(primaryKey)
+        }
+        if (!usbSelectionListsEqual(StreamingPreferences.usbPassthroughDevices, devices)) {
+            StreamingPreferences.usbPassthroughDevices = devices
+        }
+
+        if (!UsbPassthroughManager.dependenciesReady) {
+            return
+        }
+        if (selected && device.state !== "bound" && device.state !== "attached") {
+            UsbPassthroughManager.bindDevice(device.busid)
+        }
+        else if (!selected && (device.state === "bound" || device.state === "attached")) {
+            UsbPassthroughManager.unbindDevice(device.busid)
+        }
+    }
+
+    Connections {
+        target: UsbPassthroughManager
+
+        onDevicesChanged: settingsPage.normalizeUsbDeviceSelections()
     }
 
     NumberAnimation on contentY {
@@ -74,6 +289,7 @@ Flickable {
         // It is required to shift focus between controls on the settings page.
         SdlGamepadKeyNavigation.setUiNavMode(true)
         StreamingPreferences.setMicrophoneMonitorActive(true)
+        UsbPassthroughManager.refresh()
 
         // Highlight the first item if a gamepad is connected
         if (SdlGamepadKeyNavigation.getConnectedGamepads() > 0) {
@@ -1316,7 +1532,7 @@ Flickable {
                         ListElement {
                             text: qsTr("Maximized")
                             val: StreamingPreferences.UI_MAXIMIZED
-                        }   
+                        }
                         ListElement {
                             text: qsTr("Fullscreen")
                             val: StreamingPreferences.UI_FULLSCREEN
@@ -1537,6 +1753,270 @@ Flickable {
                     checked: StreamingPreferences.reverseScrollDirection
                     onCheckedChanged: {
                         StreamingPreferences.reverseScrollDirection = checked
+                    }
+                }
+            }
+        }
+
+        GroupBox {
+            id: usbPassthroughSettingsGroupBox
+            width: (parent.width - (parent.leftPadding + parent.rightPadding))
+            padding: 12
+            title: "<font color=\"skyblue\">" + qsTr("USB Passthrough") + "</font>"
+            font.pointSize: 12
+
+            Column {
+                anchors.fill: parent
+                spacing: 7
+
+                CheckBox {
+                    id: enableUsbPassthroughCheck
+                    width: parent.width
+                    text: qsTr("Enable USB passthrough")
+                    font.pointSize: 12
+                    enabled: UsbPassthroughManager.supported
+                    checked: StreamingPreferences.enableUsbPassthrough
+                    onClicked: {
+                        StreamingPreferences.enableUsbPassthrough = checked
+                        if (checked) {
+                            UsbPassthroughManager.refresh()
+                        }
+                    }
+                }
+
+                Row {
+                    width: parent.width
+                    spacing: 8
+
+                    Button {
+                        id: refreshUsbButton
+                        text: qsTr("Refresh")
+                        enabled: UsbPassthroughManager.supported
+                        onClicked: UsbPassthroughManager.refresh()
+                    }
+
+                    Button {
+                        id: installUsbDependencyButton
+                        text: UsbPassthroughManager.backend === "linux-usbip" ?
+                                  qsTr("Load modules") :
+                                  (UsbPassthroughManager.dependenciesReady ? qsTr("Repair usbipd-win") : qsTr("Install usbipd-win"))
+                        visible: UsbPassthroughManager.backend === "windows-usbipd-win" ||
+                                 (UsbPassthroughManager.backend === "linux-usbip" &&
+                                  (!UsbPassthroughManager.usbipCoreLoaded || !UsbPassthroughManager.usbipHostLoaded))
+                        enabled: UsbPassthroughManager.supported
+                        onClicked: UsbPassthroughManager.installDependency()
+                    }
+
+                    Button {
+                        id: testUsbExporterButton
+                        text: qsTr("Test exporter")
+                        visible: UsbPassthroughManager.supported
+                        enabled: UsbPassthroughManager.supported
+                        onClicked: UsbPassthroughManager.testExporter()
+                    }
+
+                    Label {
+                        width: Math.max(40, parent.width -
+                                        refreshUsbButton.width -
+                                        (installUsbDependencyButton.visible ? installUsbDependencyButton.width + parent.spacing : 0) -
+                                        (testUsbExporterButton.visible ? testUsbExporterButton.width + parent.spacing : 0) -
+                                        parent.spacing)
+                        anchors.verticalCenter: refreshUsbButton.verticalCenter
+                        text: UsbPassthroughManager.backend
+                        font.pointSize: 10
+                        elide: Text.ElideRight
+                        color: "#b9c4d0"
+                    }
+                }
+
+                Label {
+                    width: parent.width
+                    text: UsbPassthroughManager.statusMessage
+                    font.pointSize: 10
+                    wrapMode: Text.Wrap
+                }
+
+                Label {
+                    width: parent.width
+                    visible: UsbPassthroughManager.backend === "windows-usbipd-win" &&
+                             UsbPassthroughManager.usbipdServiceState !== ""
+                    text: qsTr("Service") + ": " + UsbPassthroughManager.usbipdServiceState
+                    font.pointSize: 10
+                    color: "#b9c4d0"
+                    wrapMode: Text.Wrap
+                }
+
+                Label {
+                    width: parent.width
+                    visible: UsbPassthroughManager.lastError !== ""
+                    text: UsbPassthroughManager.lastError
+                    font.pointSize: 10
+                    color: "#ff8f8f"
+                    wrapMode: Text.Wrap
+                }
+
+                Label {
+                    width: parent.width
+                    visible: StreamingPreferences.enableUsbPassthrough &&
+                             UsbPassthroughManager.backend === "windows-usbipd-win" &&
+                             UsbPassthroughManager.dependenciesReady
+                    text: qsTr("Windows USB sharing uses usbipd-win and may ask for administrator approval when sharing or unsharing a device.")
+                    font.pointSize: 10
+                    color: "#b9c4d0"
+                    wrapMode: Text.Wrap
+                }
+
+                Label {
+                    width: parent.width
+                    visible: StreamingPreferences.enableUsbPassthrough &&
+                             UsbPassthroughManager.backend === "linux-usbip" &&
+                             UsbPassthroughManager.dependenciesReady
+                    text: qsTr("Linux USB sharing uses usbip and may ask for administrator approval when sharing or unsharing a device.")
+                    font.pointSize: 10
+                    color: "#b9c4d0"
+                    wrapMode: Text.Wrap
+                }
+
+                CheckBox {
+                    width: parent.width
+                    visible: StreamingPreferences.enableUsbPassthrough &&
+                             UsbPassthroughManager.supported
+                    text: qsTr("Allow USB mass-storage devices")
+                    font.pointSize: 10
+                    checked: StreamingPreferences.allowUsbStoragePassthrough
+                    onClicked: {
+                        StreamingPreferences.allowUsbStoragePassthrough = checked
+                        settingsPage.normalizeUsbDeviceSelections()
+                    }
+                }
+
+                Label {
+                    width: parent.width
+                    visible: StreamingPreferences.enableUsbPassthrough &&
+                             StreamingPreferences.allowUsbStoragePassthrough
+                    text: qsTr("Only use this with non-critical drives. The Vibepollo host must also allow storage devices before it can attach them.")
+                    font.pointSize: 9
+                    color: "#ffd37a"
+                    wrapMode: Text.Wrap
+                }
+
+                Label {
+                    width: parent.width
+                    visible: StreamingPreferences.enableUsbPassthrough &&
+                             UsbPassthroughManager.dependenciesReady &&
+                             UsbPassthroughManager.devices.length === 0
+                    text: qsTr("No USB devices found.")
+                    font.pointSize: 10
+                    color: "#b9c4d0"
+                    wrapMode: Text.Wrap
+                }
+
+                Repeater {
+                    model: StreamingPreferences.enableUsbPassthrough ? UsbPassthroughManager.devices : []
+
+                    Rectangle {
+                        property var device: modelData
+
+                        width: usbPassthroughSettingsGroupBox.width - (usbPassthroughSettingsGroupBox.leftPadding + usbPassthroughSettingsGroupBox.rightPadding)
+                        height: usbDeviceContent.height + 14
+                        radius: 4
+                        color: "#202733"
+                        border.width: 1
+                        border.color: !settingsPage.isUsbDeviceBlocked(device) && settingsPage.isUsbDeviceSelected(device) ? "#45c486" : "#3d4857"
+
+                        Column {
+                            id: usbDeviceContent
+                            anchors {
+                                left: parent.left
+                                right: parent.right
+                                top: parent.top
+                                margins: 7
+                            }
+                            spacing: 4
+
+                            Row {
+                                width: parent.width
+                                spacing: 8
+
+                                CheckBox {
+                                    id: deviceCheck
+                                    width: Math.min(150, parent.width)
+                                    text: qsTr("Passthrough")
+                                    font.pointSize: 10
+                                    enabled: enableUsbPassthroughCheck.checked &&
+                                             UsbPassthroughManager.dependenciesReady &&
+                                             device.busid &&
+                                             device.state !== "disconnected" &&
+                                             !settingsPage.isUsbDeviceBlocked(device)
+                                    checked: !settingsPage.isUsbDeviceBlocked(device) && settingsPage.isUsbDeviceSelected(device)
+                                    onClicked: settingsPage.setUsbDeviceSelected(device, checked)
+                                }
+
+                                Label {
+                                    width: Math.max(40, parent.width - deviceCheck.width - usbStateLabel.width - (parent.spacing * 2))
+                                    anchors.verticalCenter: deviceCheck.verticalCenter
+                                    text: settingsPage.usbDeviceName(device)
+                                    font.pointSize: 10
+                                    elide: Text.ElideRight
+                                }
+
+                                Label {
+                                    id: usbStateLabel
+                                    anchors.verticalCenter: deviceCheck.verticalCenter
+                                    text: settingsPage.usbDeviceStateLabel(device)
+                                    font.pointSize: 9
+                                    font.bold: true
+                                    color: settingsPage.isUsbDeviceBlocked(device) ? "#ff8f8f" : (device.state === "attached" || device.state === "bound" ? "#45c486" : "#b9c4d0")
+                                }
+                            }
+
+                            Label {
+                                width: parent.width
+                                text: settingsPage.usbDeviceDetails(device)
+                                font.pointSize: 9
+                                color: "#b9c4d0"
+                                wrapMode: Text.Wrap
+                                visible: text !== ""
+                            }
+
+                            Label {
+                                width: parent.width
+                                text: qsTr("This device will be unavailable locally while USB passthrough is active.")
+                                font.pointSize: 9
+                                color: "#ffd37a"
+                                wrapMode: Text.Wrap
+                                visible: !settingsPage.isUsbDeviceBlocked(device) && settingsPage.isUsbDeviceSelected(device)
+                            }
+
+                            Label {
+                                width: parent.width
+                                text: settingsPage.usbDeviceError(device)
+                                font.pointSize: 9
+                                color: "#ff8f8f"
+                                wrapMode: Text.Wrap
+                                visible: text !== ""
+                            }
+
+                            Label {
+                                width: parent.width
+                                text: device.blockReason || ""
+                                font.pointSize: 9
+                                color: "#ff8f8f"
+                                wrapMode: Text.Wrap
+                                visible: settingsPage.isUsbDeviceBlocked(device) && text !== ""
+                            }
+
+                            Label {
+                                width: parent.width
+                                text: qsTr("Storage passthrough is allowed on this client. Keep the host storage gate enabled only while testing.")
+                                font.pointSize: 9
+                                color: "#ffd37a"
+                                wrapMode: Text.Wrap
+                                visible: device.storageClass &&
+                                         !settingsPage.isUsbDeviceBlocked(device) &&
+                                         settingsPage.isUsbDeviceSelected(device)
+                            }
+                        }
                     }
                 }
             }
