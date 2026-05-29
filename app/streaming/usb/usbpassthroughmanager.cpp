@@ -402,6 +402,57 @@ bool isStorageClassDevice(const QVariantMap& device)
            textSuggestsStorageClass(device.value(QStringLiteral("product")).toString());
 }
 
+QString deviceSearchText(const QVariantMap& device)
+{
+    QStringList values;
+    values << device.value(QStringLiteral("vendor")).toString();
+    values << device.value(QStringLiteral("product")).toString();
+    values << device.value(QStringLiteral("description")).toString();
+    values << device.value(QStringLiteral("deviceClass")).toString();
+    values << device.value(QStringLiteral("vid")).toString();
+    values << device.value(QStringLiteral("pid")).toString();
+    values << device.value(QStringLiteral("interfaces")).toStringList();
+    values << device.value(QStringLiteral("transferTypes")).toStringList();
+    return values.join(QLatin1Char(' ')).toLower();
+}
+
+bool deviceTextContainsAny(const QVariantMap& device, const QStringList& needles)
+{
+    const QString text = deviceSearchText(device);
+    for (const QString& needle : needles) {
+        if (!needle.isEmpty() && text.contains(needle)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool textSuggestsVideoDevice(const QVariantMap& device)
+{
+    return deviceTextContainsAny(device, {
+        QStringLiteral("webcam"),
+        QStringLiteral("camera"),
+        QStringLiteral("cam "),
+        QStringLiteral(" uvc"),
+        QStringLiteral("uvc "),
+        QStringLiteral("video"),
+        QStringLiteral("capture"),
+        QStringLiteral("insta360"),
+        QStringLiteral("link 2c"),
+    });
+}
+
+bool textSuggestsAudioDevice(const QVariantMap& device)
+{
+    return deviceTextContainsAny(device, {
+        QStringLiteral("audio"),
+        QStringLiteral("microphone"),
+        QStringLiteral("mic "),
+        QStringLiteral("speaker"),
+        QStringLiteral("headset"),
+    });
+}
+
 bool hasClassLabel(const QVariantMap& device, const QString& label)
 {
     const auto matches = [&label](const QString& value) {
@@ -498,10 +549,17 @@ UsbTransportConfig transportConfigForProfile(const QString& profile)
 
 UsbTransportConfig transportConfigForDevice(const QVariantMap& device)
 {
-    QString profile = device.value(QStringLiteral("transportProfile")).toString();
-    if (profile.isEmpty()) {
+    QString profile = normalizedEndpointTransferType(device.value(QStringLiteral("transportProfile")).toString());
+    if (profile == QStringLiteral("low_latency")) {
+        profile = QStringLiteral("low-latency");
+    }
+
+    const bool shouldInferProfile = profile.isEmpty() || profile == QStringLiteral("balanced");
+    if (shouldInferProfile) {
         const bool isAudioVideo = hasClassLabel(device, QStringLiteral("audio")) ||
-                                  hasClassLabel(device, QStringLiteral("video"));
+                                  hasClassLabel(device, QStringLiteral("video")) ||
+                                  textSuggestsAudioDevice(device) ||
+                                  textSuggestsVideoDevice(device);
         if (isAudioVideo || hasTransferType(device, QStringLiteral("isochronous"))) {
             profile = QStringLiteral("isochronous");
         }
