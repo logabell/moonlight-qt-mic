@@ -3,6 +3,7 @@
 #include <QCryptographicHash>
 #include <QDebug>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonArray>
@@ -32,15 +33,30 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#include <algorithm>
 
 namespace {
 
 UsbPassthroughManager* s_Manager = nullptr;
 constexpr quint16 kDefaultUsbipPort = 3240;
-constexpr int kTunnelCopyBufferSize = 16 * 1024;
+constexpr int kBalancedTunnelCopyBufferSize = 64 * 1024;
+constexpr int kBalancedTunnelSocketBufferSize = 4 * 1024 * 1024;
 constexpr auto kTunnelStartupRetryWindow = std::chrono::seconds(30);
 constexpr auto kTunnelStartupRetryDelay = std::chrono::milliseconds(750);
 constexpr auto kTunnelStartupWaitSlack = std::chrono::seconds(20);
+
+struct UsbTransportConfig {
+    QString profile = QStringLiteral("balanced");
+    QString risk = QStringLiteral("standard");
+    QString note;
+    int socketBufferBytes = kBalancedTunnelSocketBufferSize;
+    int copyBufferBytes = kBalancedTunnelCopyBufferSize;
+    int readWaitMs = 5;
+    int writeTimeoutMs = 1000;
+    int writeDrainThresholdBytes = kBalancedTunnelSocketBufferSize / 2;
+    bool lowDelay = true;
+    bool prioritizeClientToHost = false;
+};
 
 struct UsbTunnelState {
     QString host;
@@ -48,6 +64,7 @@ struct UsbTunnelState {
     QString busId;
     quint16 hostPort = 0;
     quint16 exporterPort = kDefaultUsbipPort;
+    UsbTransportConfig transport;
     std::atomic_bool stopRequested {false};
     std::thread thread;
     std::mutex startupMutex;
@@ -107,6 +124,9 @@ QString driverNameForDevice(const QString& sysfsPath)
 QString classCodeToLabel(const QString& classCode)
 {
     const QString normalized = classCode.trimmed().toLower();
+    if (normalized == QStringLiteral("01")) {
+        return QStringLiteral("audio");
+    }
     if (normalized == QStringLiteral("00")) {
         return QStringLiteral("interface");
     }
@@ -127,6 +147,12 @@ QString classCodeToLabel(const QString& classCode)
     }
     if (normalized == QStringLiteral("0b")) {
         return QStringLiteral("smart_card");
+    }
+    if (normalized == QStringLiteral("0e")) {
+        return QStringLiteral("video");
+    }
+    if (normalized == QStringLiteral("0f")) {
+        return QStringLiteral("personal_healthcare");
     }
     if (normalized == QStringLiteral("e0")) {
         return QStringLiteral("wireless_controller");
@@ -162,6 +188,151 @@ QStringList interfaceClassesForDevice(const QString& sysfsPath, const QString& b
 
     interfaces.sort();
     return interfaces;
+}
+
+int parseUsbInteger(QString value, int fallback = -1)
+{
+    value = value.trimmed();
+    if (value.isEmpty()) {
+        return fallback;
+    }
+
+    bool ok = false;
+    int base = 10;
+    if (value.startsWith(QStringLiteral("0x"), Qt::CaseInsensitive)) {
+        value.remove(0, 2);
+        base = 16;
+    }
+    else if (value.contains(QRegularExpression(QStringLiteral("[a-fA-F]")))) {
+        base = 16;
+    }
+
+    const int result = value.toInt(&ok, base);
+    return ok ? result : fallback;
+}
+
+QString normalizedEndpointTransferType(QString value)
+{
+    value = value.trimmed().toLower();
+    value.replace(QLatin1Char('-'), QLatin1Char('_'));
+    value.replace(QLatin1Char(' '), QLatin1Char('_'));
+    if (value == QStringLiteral("iso")) {
+        return QStringLiteral("isochronous");
+    }
+    if (value == QStringLiteral("intr")) {
+        return QStringLiteral("interrupt");
+    }
+    return value;
+}
+
+QString endpointTransferTypeFromAttributes(const QString& typeText, const QString& attributesText)
+{
+    const QString type = normalizedEndpointTransferType(typeText);
+    if (!type.isEmpty()) {
+        return type;
+    }
+
+    const int attributes = parseUsbInteger(attributesText, -1);
+    if (attributes < 0) {
+        return QString();
+    }
+
+    switch (attributes & 0x3) {
+    case 0:
+        return QStringLiteral("control");
+    case 1:
+        return QStringLiteral("isochronous");
+    case 2:
+        return QStringLiteral("bulk");
+    case 3:
+        return QStringLiteral("interrupt");
+    default:
+        return QString();
+    }
+}
+
+void appendUniqueString(QStringList& values, const QString& value)
+{
+    if (!value.isEmpty() && !values.contains(value)) {
+        values.append(value);
+    }
+}
+
+struct UsbEndpointMetadata {
+    QVariantList endpoints;
+    QStringList transferTypes;
+    QVariantMap endpointCounts;
+    int maxPacketSize = 0;
+};
+
+UsbEndpointMetadata endpointMetadataForLinuxDevice(const QString& sysfsPath, const QString& busId)
+{
+    UsbEndpointMetadata metadata;
+    int bulkCount = 0;
+    int interruptCount = 0;
+    int isochronousCount = 0;
+    int controlCount = 0;
+
+    QDir deviceDir(sysfsPath);
+    const QString prefix = busId + QStringLiteral(":");
+    const QStringList interfaces = deviceDir.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
+    for (const QString& interfaceEntry : interfaces) {
+        if (!interfaceEntry.startsWith(prefix)) {
+            continue;
+        }
+
+        QDir interfaceDir(deviceDir.filePath(interfaceEntry));
+        const QString interfaceClass = classCodeToLabel(readTextFile(interfaceDir.filePath(QStringLiteral("bInterfaceClass"))));
+        const QString interfaceSubClass = readTextFile(interfaceDir.filePath(QStringLiteral("bInterfaceSubClass"))).toLower();
+        const QString interfaceProtocol = readTextFile(interfaceDir.filePath(QStringLiteral("bInterfaceProtocol"))).toLower();
+        const QStringList endpointEntries = interfaceDir.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
+        for (const QString& endpointEntry : endpointEntries) {
+            if (!endpointEntry.startsWith(QStringLiteral("ep_"))) {
+                continue;
+            }
+
+            const QString endpointPath = interfaceDir.filePath(endpointEntry);
+            const QString address = readTextFile(endpointPath + QStringLiteral("/bEndpointAddress"));
+            const QString attributes = readTextFile(endpointPath + QStringLiteral("/bmAttributes"));
+            const QString type = endpointTransferTypeFromAttributes(readTextFile(endpointPath + QStringLiteral("/type")), attributes);
+            const int maxPacketSize = parseUsbInteger(readTextFile(endpointPath + QStringLiteral("/wMaxPacketSize")), 0);
+
+            if (type == QStringLiteral("bulk")) {
+                ++bulkCount;
+            }
+            else if (type == QStringLiteral("interrupt")) {
+                ++interruptCount;
+            }
+            else if (type == QStringLiteral("isochronous")) {
+                ++isochronousCount;
+            }
+            else if (type == QStringLiteral("control")) {
+                ++controlCount;
+            }
+            appendUniqueString(metadata.transferTypes, type);
+            metadata.maxPacketSize = std::max(metadata.maxPacketSize, maxPacketSize);
+
+            if (metadata.endpoints.size() < 32) {
+                QVariantMap endpoint;
+                endpoint[QStringLiteral("interface")] = interfaceEntry;
+                endpoint[QStringLiteral("interfaceClass")] = interfaceClass;
+                endpoint[QStringLiteral("interfaceSubClass")] = interfaceSubClass;
+                endpoint[QStringLiteral("interfaceProtocol")] = interfaceProtocol;
+                endpoint[QStringLiteral("address")] = address.isEmpty() ? endpointEntry.mid(3) : address;
+                endpoint[QStringLiteral("type")] = type;
+                endpoint[QStringLiteral("maxPacketSize")] = maxPacketSize;
+                endpoint[QStringLiteral("interval")] = readTextFile(endpointPath + QStringLiteral("/bInterval"));
+                metadata.endpoints.append(endpoint);
+            }
+        }
+    }
+
+    metadata.transferTypes.sort();
+    metadata.endpointCounts[QStringLiteral("bulk")] = bulkCount;
+    metadata.endpointCounts[QStringLiteral("interrupt")] = interruptCount;
+    metadata.endpointCounts[QStringLiteral("isochronous")] = isochronousCount;
+    metadata.endpointCounts[QStringLiteral("control")] = controlCount;
+    return metadata;
 }
 
 QString deriveDeviceClass(const QString& deviceClass, const QStringList& interfaces)
@@ -231,6 +402,144 @@ bool isStorageClassDevice(const QVariantMap& device)
            textSuggestsStorageClass(device.value(QStringLiteral("product")).toString());
 }
 
+bool hasClassLabel(const QVariantMap& device, const QString& label)
+{
+    const auto matches = [&label](const QString& value) {
+        const QString normalized = normalizedUsbClassLabel(value);
+        if (normalized == label) {
+            return true;
+        }
+        if (label == QStringLiteral("audio")) {
+            return normalized == QStringLiteral("1");
+        }
+        if (label == QStringLiteral("hid")) {
+            return normalized == QStringLiteral("3");
+        }
+        if (label == QStringLiteral("printer")) {
+            return normalized == QStringLiteral("7");
+        }
+        if (label == QStringLiteral("smart_card")) {
+            return normalized == QStringLiteral("b");
+        }
+        if (label == QStringLiteral("video")) {
+            return normalized == QStringLiteral("e");
+        }
+        if (label == QStringLiteral("wireless_controller")) {
+            return normalized == QStringLiteral("e0");
+        }
+        return false;
+    };
+
+    if (matches(device.value(QStringLiteral("deviceClass")).toString())) {
+        return true;
+    }
+
+    const QStringList interfaces = device.value(QStringLiteral("interfaces")).toStringList();
+    for (const QString& interfaceClass : interfaces) {
+        if (matches(interfaceClass)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool hasTransferType(const QVariantMap& device, const QString& transferType)
+{
+    const QStringList transferTypes = device.value(QStringLiteral("transferTypes")).toStringList();
+    for (const QString& value : transferTypes) {
+        if (normalizedEndpointTransferType(value) == transferType) {
+            return true;
+        }
+    }
+    return false;
+}
+
+UsbTransportConfig transportConfigForProfile(const QString& profile)
+{
+    UsbTransportConfig config;
+    config.profile = profile.isEmpty() ? QStringLiteral("balanced") : profile;
+
+    if (config.profile == QStringLiteral("isochronous")) {
+        config.risk = QStringLiteral("experimental");
+        config.note = QStringLiteral("Video/audio-style USB devices use larger socket buffers and shorter polling to reduce streaming stalls.");
+        config.socketBufferBytes = 8 * 1024 * 1024;
+        config.copyBufferBytes = 256 * 1024;
+        config.readWaitMs = 1;
+        config.writeTimeoutMs = 2500;
+        config.writeDrainThresholdBytes = 6 * 1024 * 1024;
+        config.prioritizeClientToHost = true;
+    }
+    else if (config.profile == QStringLiteral("bulk")) {
+        config.risk = QStringLiteral("standard");
+        config.note = QStringLiteral("Bulk-style USB devices use larger buffers for sustained transfers.");
+        config.socketBufferBytes = 8 * 1024 * 1024;
+        config.copyBufferBytes = 256 * 1024;
+        config.readWaitMs = 2;
+        config.writeTimeoutMs = 3000;
+        config.writeDrainThresholdBytes = 6 * 1024 * 1024;
+    }
+    else if (config.profile == QStringLiteral("low-latency")) {
+        config.risk = QStringLiteral("stable");
+        config.note = QStringLiteral("HID/interrupt-style USB devices use smaller buffers and shorter waits for input latency.");
+        config.socketBufferBytes = 1024 * 1024;
+        config.copyBufferBytes = 16 * 1024;
+        config.readWaitMs = 1;
+        config.writeTimeoutMs = 500;
+        config.writeDrainThresholdBytes = 256 * 1024;
+    }
+    else {
+        config.profile = QStringLiteral("balanced");
+        config.risk = QStringLiteral("standard");
+        config.note = QStringLiteral("Balanced USB transport settings are used when endpoint requirements are mixed or unknown.");
+    }
+
+    return config;
+}
+
+UsbTransportConfig transportConfigForDevice(const QVariantMap& device)
+{
+    QString profile = device.value(QStringLiteral("transportProfile")).toString();
+    if (profile.isEmpty()) {
+        const bool isAudioVideo = hasClassLabel(device, QStringLiteral("audio")) ||
+                                  hasClassLabel(device, QStringLiteral("video"));
+        if (isAudioVideo || hasTransferType(device, QStringLiteral("isochronous"))) {
+            profile = QStringLiteral("isochronous");
+        }
+        else if (isStorageClassDevice(device) ||
+                 hasClassLabel(device, QStringLiteral("printer")) ||
+                 hasClassLabel(device, QStringLiteral("smart_card")) ||
+                 hasTransferType(device, QStringLiteral("bulk"))) {
+            profile = QStringLiteral("bulk");
+        }
+        else if (hasClassLabel(device, QStringLiteral("hid")) ||
+                 hasClassLabel(device, QStringLiteral("wireless_controller")) ||
+                 hasTransferType(device, QStringLiteral("interrupt"))) {
+            profile = QStringLiteral("low-latency");
+        }
+        else {
+            profile = QStringLiteral("balanced");
+        }
+    }
+
+    return transportConfigForProfile(profile);
+}
+
+void applyUsbTransportPolicy(QVariantMap& device)
+{
+    const UsbTransportConfig transport = transportConfigForDevice(device);
+    device[QStringLiteral("transportProfile")] = transport.profile;
+    device[QStringLiteral("transportRisk")] = transport.risk;
+    device[QStringLiteral("transportNote")] = transport.note;
+    device[QStringLiteral("transportSocketBufferBytes")] = transport.socketBufferBytes;
+    device[QStringLiteral("transportCopyBufferBytes")] = transport.copyBufferBytes;
+    device[QStringLiteral("transportReadWaitMs")] = transport.readWaitMs;
+    device[QStringLiteral("transportWriteTimeoutMs")] = transport.writeTimeoutMs;
+    device[QStringLiteral("transportWriteDrainThresholdBytes")] = transport.writeDrainThresholdBytes;
+    device[QStringLiteral("transportLowDelay")] = transport.lowDelay;
+    device[QStringLiteral("transportPrioritizeClientToHost")] = transport.prioritizeClientToHost;
+    device[QStringLiteral("transportExperimental")] = transport.risk == QStringLiteral("experimental");
+}
+
 QString storageClassBlockReason()
 {
     return QStringLiteral("Storage-class USB devices are blocked by default for this USB passthrough MVP.");
@@ -244,6 +553,7 @@ void applyUsbSafetyPolicy(QVariantMap& device)
     if (storageClass) {
         device[QStringLiteral("blockReason")] = storageClassBlockReason();
     }
+    applyUsbTransportPolicy(device);
 }
 
 QString blockedReasonForBusId(const QVariantList& devices, const QString& busId)
@@ -290,16 +600,41 @@ bool safeTunnelToken(const QString& value)
     return true;
 }
 
-void copyAvailable(QTcpSocket& from, QTcpSocket& to)
+void configureTunnelSocket(QTcpSocket& socket, const UsbTransportConfig& transport)
 {
+    socket.setSocketOption(QAbstractSocket::LowDelayOption, transport.lowDelay ? 1 : 0);
+    socket.setSocketOption(QAbstractSocket::KeepAliveOption, 1);
+    socket.setSocketOption(QAbstractSocket::ReceiveBufferSizeSocketOption, transport.socketBufferBytes);
+    socket.setSocketOption(QAbstractSocket::SendBufferSizeSocketOption, transport.socketBufferBytes);
+}
+
+qint64 copyAvailable(QTcpSocket& from, QTcpSocket& to, const UsbTransportConfig& transport)
+{
+    qint64 copied = 0;
     while (from.bytesAvailable() > 0) {
-        const QByteArray data = from.read(qMin<qint64>(from.bytesAvailable(), kTunnelCopyBufferSize));
+        const QByteArray data = from.read(qMin<qint64>(from.bytesAvailable(), transport.copyBufferBytes));
         if (data.isEmpty()) {
-            return;
+            return copied;
         }
-        to.write(data);
-        to.waitForBytesWritten(1000);
+
+        qint64 written = 0;
+        while (written < data.size()) {
+            const qint64 result = to.write(data.constData() + written, data.size() - written);
+            if (result < 0) {
+                qWarning() << "USB passthrough tunnel write failed" << to.errorString();
+                return -1;
+            }
+            written += result;
+            copied += result;
+            if (written < data.size() || to.bytesToWrite() > transport.writeDrainThresholdBytes) {
+                if (!to.waitForBytesWritten(transport.writeTimeoutMs)) {
+                    qWarning() << "USB passthrough tunnel write timed out" << to.errorString();
+                    return -1;
+                }
+            }
+        }
     }
+    return copied;
 }
 
 void sleepUntilStopRequested(const std::shared_ptr<UsbTunnelState>& state, std::chrono::milliseconds delay)
@@ -345,6 +680,7 @@ void runTunnelThread(std::shared_ptr<UsbTunnelState> state)
                        << "attempt" << attempt << hostSocket.errorString();
         }
         else {
+            configureTunnelSocket(hostSocket, state->transport);
             const QByteArray handshake =
                 QByteArrayLiteral("VPUSB1 ") +
                 state->token.toLatin1() +
@@ -364,21 +700,82 @@ void runTunnelThread(std::shared_ptr<UsbTunnelState> state)
                                << "attempt" << attempt << exporterSocket.errorString();
                 }
                 else {
+                    configureTunnelSocket(exporterSocket, state->transport);
                     if (!tunnelConnectedOnce) {
                         tunnelConnectedOnce = true;
                         reportTunnelStartup(state, true, QString());
                     }
                     qInfo() << "USB passthrough tunnel connected for" << state->busId
-                            << "via" << state->host << state->hostPort;
+                            << "via" << state->host << state->hostPort
+                            << "profile" << state->transport.profile;
 
+                    QElapsedTimer statsTimer;
+                    statsTimer.start();
+                    qint64 hostToClientBytes = 0;
+                    qint64 clientToHostBytes = 0;
+                    bool copyFailed = false;
+                    const auto copyDirection = [&](QTcpSocket& from, QTcpSocket& to, qint64& total) {
+                        const qint64 result = copyAvailable(from, to, state->transport);
+                        if (result < 0) {
+                            copyFailed = true;
+                            hostSocket.disconnectFromHost();
+                            exporterSocket.disconnectFromHost();
+                            return false;
+                        }
+                        total += result;
+                        return result > 0;
+                    };
+                    const auto drainReadyData = [&]() {
+                        bool copied = false;
+                        if (state->transport.prioritizeClientToHost) {
+                            if (exporterSocket.bytesAvailable() > 0) {
+                                copied = copyDirection(exporterSocket, hostSocket, clientToHostBytes) || copied;
+                            }
+                            if (hostSocket.bytesAvailable() > 0) {
+                                copied = copyDirection(hostSocket, exporterSocket, hostToClientBytes) || copied;
+                            }
+                        }
+                        else {
+                            if (hostSocket.bytesAvailable() > 0) {
+                                copied = copyDirection(hostSocket, exporterSocket, hostToClientBytes) || copied;
+                            }
+                            if (exporterSocket.bytesAvailable() > 0) {
+                                copied = copyDirection(exporterSocket, hostSocket, clientToHostBytes) || copied;
+                            }
+                        }
+                        return copied;
+                    };
                     while (!state->stopRequested.load(std::memory_order_acquire) &&
                            hostSocket.state() == QAbstractSocket::ConnectedState &&
                            exporterSocket.state() == QAbstractSocket::ConnectedState) {
-                        if (hostSocket.waitForReadyRead(25)) {
-                            copyAvailable(hostSocket, exporterSocket);
+                        bool copied = drainReadyData();
+                        if (!copied && !copyFailed) {
+                            QTcpSocket& firstSocket = state->transport.prioritizeClientToHost ? exporterSocket : hostSocket;
+                            QTcpSocket& secondSocket = state->transport.prioritizeClientToHost ? hostSocket : exporterSocket;
+                            qint64& firstBytes = state->transport.prioritizeClientToHost ? clientToHostBytes : hostToClientBytes;
+                            qint64& secondBytes = state->transport.prioritizeClientToHost ? hostToClientBytes : clientToHostBytes;
+                            QTcpSocket& firstTarget = state->transport.prioritizeClientToHost ? hostSocket : exporterSocket;
+                            QTcpSocket& secondTarget = state->transport.prioritizeClientToHost ? exporterSocket : hostSocket;
+
+                            if (firstSocket.waitForReadyRead(state->transport.readWaitMs)) {
+                                copied = copyDirection(firstSocket, firstTarget, firstBytes) || copied;
+                            }
+                            if (!copyFailed && secondSocket.bytesAvailable() > 0) {
+                                copied = copyDirection(secondSocket, secondTarget, secondBytes) || copied;
+                            }
+                            if (!copied && !copyFailed && secondSocket.waitForReadyRead(state->transport.readWaitMs)) {
+                                copyDirection(secondSocket, secondTarget, secondBytes);
+                            }
                         }
-                        if (exporterSocket.waitForReadyRead(25)) {
-                            copyAvailable(exporterSocket, hostSocket);
+                        if (copyFailed) {
+                            break;
+                        }
+                        if (statsTimer.elapsed() >= 5000) {
+                            qInfo() << "USB passthrough tunnel stats for" << state->busId
+                                    << "profile" << state->transport.profile
+                                    << "hostToClientBytes" << hostToClientBytes
+                                    << "clientToHostBytes" << clientToHostBytes;
+                            statsTimer.restart();
                         }
                     }
 
@@ -388,6 +785,9 @@ void runTunnelThread(std::shared_ptr<UsbTunnelState> state)
                     }
 
                     qInfo() << "USB passthrough tunnel connection closed for" << state->busId
+                            << "profile" << state->transport.profile
+                            << "hostToClientBytes" << hostToClientBytes
+                            << "clientToHostBytes" << clientToHostBytes
                             << "- reconnecting while the stream remains active";
                 }
             }
@@ -1126,6 +1526,19 @@ bool UsbPassthroughManager::startTunnel(const QString& host, quint16 hostPort, c
     state->token = token;
     state->busId = busId;
     state->exporterPort = exporterPort == 0 ? kDefaultUsbipPort : exporterPort;
+    for (const QVariant& deviceVariant : m_Devices) {
+        const QVariantMap device = deviceVariant.toMap();
+        if (device.value(QStringLiteral("busid")).toString() == busId) {
+            state->transport = transportConfigForDevice(device);
+            break;
+        }
+    }
+    qInfo() << "USB passthrough tunnel transport selected for" << busId
+            << "profile" << state->transport.profile
+            << "risk" << state->transport.risk
+            << "socketBufferBytes" << state->transport.socketBufferBytes
+            << "copyBufferBytes" << state->transport.copyBufferBytes
+            << "readWaitMs" << state->transport.readWaitMs;
 
     {
         std::lock_guard<std::mutex> lock(tunnelMutex());
@@ -1246,6 +1659,7 @@ QVariantList UsbPassthroughManager::enumerateLinuxDevices() const
         const QString serial = readTextFile(path + QStringLiteral("/serial"));
         const QString deviceClassCode = readTextFile(path + QStringLiteral("/bDeviceClass"));
         const QStringList interfaces = interfaceClassesForDevice(path, entry);
+        const UsbEndpointMetadata endpointMetadata = endpointMetadataForLinuxDevice(path, entry);
         const QString driver = driverNameForDevice(path);
 
         QVariantMap device;
@@ -1259,6 +1673,10 @@ QVariantList UsbPassthroughManager::enumerateLinuxDevices() const
         device[QStringLiteral("serialPresent")] = !serial.isEmpty();
         device[QStringLiteral("deviceClass")] = deriveDeviceClass(deviceClassCode, interfaces);
         device[QStringLiteral("interfaces")] = interfaces;
+        device[QStringLiteral("transferTypes")] = endpointMetadata.transferTypes;
+        device[QStringLiteral("endpointCounts")] = endpointMetadata.endpointCounts;
+        device[QStringLiteral("endpointMaxPacketSize")] = endpointMetadata.maxPacketSize;
+        device[QStringLiteral("endpoints")] = endpointMetadata.endpoints;
         device[QStringLiteral("speed")] = readTextFile(path + QStringLiteral("/speed"));
         device[QStringLiteral("clientOs")] = QStringLiteral("linux");
         device[QStringLiteral("backend")] = QStringLiteral("linux-usbip");

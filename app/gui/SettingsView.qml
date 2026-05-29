@@ -73,6 +73,12 @@ Flickable {
         if (device.storageClass && (!device.deviceClass || device.deviceClass === "unknown")) {
             parts.push(qsTr("storage"))
         }
+        if (device.transferTypes && device.transferTypes.length > 0) {
+            parts.push(device.transferTypes.join(", "))
+        }
+        if (device.transportProfile) {
+            parts.push(device.transportProfile)
+        }
         if (device.driver) {
             parts.push(device.driver)
         }

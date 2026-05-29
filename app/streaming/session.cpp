@@ -86,6 +86,11 @@ static void addUsbBool(QJsonObject& object, const QVariantMap& source, const QSt
     object.insert(key, source.contains(key) ? source.value(key).toBool() : defaultValue);
 }
 
+static void addUsbInt(QJsonObject& object, const QVariantMap& source, const QString& key, int defaultValue = 0)
+{
+    object.insert(key, source.contains(key) ? source.value(key).toInt() : defaultValue);
+}
+
 static void addUsbStringList(QJsonObject& object, const QVariantMap& source, const QString& key)
 {
     QJsonArray array;
@@ -93,6 +98,16 @@ static void addUsbStringList(QJsonObject& object, const QVariantMap& source, con
         array.append(value);
     }
     object.insert(key, array);
+}
+
+static void addUsbIntMap(QJsonObject& object, const QVariantMap& source, const QString& key)
+{
+    QJsonObject mapObject;
+    const QVariantMap sourceMap = source.value(key).toMap();
+    for (auto it = sourceMap.constBegin(); it != sourceMap.constEnd(); ++it) {
+        mapObject.insert(it.key(), it.value().toInt());
+    }
+    object.insert(key, mapObject);
 }
 
 static bool isUsbDeviceExportableForLaunch(const QVariantMap& device)
@@ -1943,6 +1958,9 @@ QString Session::buildUsbPassthroughLaunchParameters()
         addUsbBool(object, device, QStringLiteral("serialPresent"));
         addUsbString(object, device, QStringLiteral("deviceClass"));
         addUsbStringList(object, device, QStringLiteral("interfaces"));
+        addUsbStringList(object, device, QStringLiteral("transferTypes"));
+        addUsbIntMap(object, device, QStringLiteral("endpointCounts"));
+        addUsbInt(object, device, QStringLiteral("endpointMaxPacketSize"));
         addUsbBool(object, device, QStringLiteral("storageClass"));
         object.insert(QStringLiteral("blocked"), blockedForLaunch);
         if (blockedForLaunch) {
@@ -1959,6 +1977,17 @@ QString Session::buildUsbPassthroughLaunchParameters()
         addUsbBool(object, device, QStringLiteral("bound"));
         addUsbBool(object, device, QStringLiteral("attached"));
         addUsbBool(object, device, QStringLiteral("forced"));
+        addUsbString(object, device, QStringLiteral("transportProfile"));
+        addUsbString(object, device, QStringLiteral("transportRisk"));
+        addUsbString(object, device, QStringLiteral("transportNote"));
+        addUsbBool(object, device, QStringLiteral("transportExperimental"));
+        addUsbBool(object, device, QStringLiteral("transportLowDelay"), true);
+        addUsbBool(object, device, QStringLiteral("transportPrioritizeClientToHost"));
+        addUsbInt(object, device, QStringLiteral("transportSocketBufferBytes"));
+        addUsbInt(object, device, QStringLiteral("transportCopyBufferBytes"));
+        addUsbInt(object, device, QStringLiteral("transportReadWaitMs"));
+        addUsbInt(object, device, QStringLiteral("transportWriteTimeoutMs"));
+        addUsbInt(object, device, QStringLiteral("transportWriteDrainThresholdBytes"));
         object.insert(QStringLiteral("selected"), true);
 
         if (object.value(QStringLiteral("backend")).toString().isEmpty()) {
