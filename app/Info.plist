@@ -50,5 +50,7 @@
 	<string>Moonlight</string>
     <key>LSApplicationCategoryType</key>
 	<string>public.app-category.games</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Moonlight needs microphone permissions to be able to use microphone passthrough.</string>
 </dict>
 </plist>
